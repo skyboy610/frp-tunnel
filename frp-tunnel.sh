@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-APP_VER="1.0.1"
+APP_VER="1.1.0"
 FRP_DEFAULT_VER="0.71.0"
 BASE_DIR="/etc/frp-tunnel"
 TUN_DIR="$BASE_DIR/tunnels"
@@ -96,7 +96,7 @@ header() {
     for i in "${!LOGO[@]}"; do
         printf '  \e[38;5;%sm%s\e[0m\n' "${LOGO_C[i]}" "${LOGO[i]}"
     done
-    printf '  \e[38;5;%sm%-58s%10s\e[0m\n\n' "$C_SUB" "Iran <-> Foreign tunnel manager" "v$APP_VER"
+    printf '  \e[38;5;%sm%-58s%10s\e[0m\n\n' "$C_SUB" "Iran <-> Kharej tunnel manager" "v$APP_VER"
     banner
     [ -n "$1" ] && title "$1"
 }
@@ -1152,7 +1152,270 @@ cert_menu() {
     done
 }
 
-META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP CREATED)
+fw_kind() {
+    if ufw_active; then
+        printf 'ufw'
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        printf 'firewalld'
+    elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)'; then
+        printf 'iptables'
+    else
+        printf 'none'
+    fi
+}
+
+fw_label() {
+    local p port src
+    IFS='|' read -r p port src <<<"$1"
+    if [ -z "$src" ]; then
+        printf '%s/%s' "${port/:/-}" "$p"
+    elif [ -n "$port" ]; then
+        printf '%s %s from %s' "$p" "${port/:/-}" "$src"
+    else
+        printf '%s from %s' "$p" "$src"
+    fi
+}
+
+fw_in() {
+    local x=$1 y
+    shift
+    for y in "$@"; do
+        [ "$x" = "$y" ] && return 0
+    done
+    return 1
+}
+
+fw_ufw_args() {
+    local p port src
+    IFS='|' read -r p port src <<<"$1"
+    if [ -z "$src" ]; then
+        UFW_ARGS=("$port/$p")
+    elif [ -n "$port" ]; then
+        UFW_ARGS=(proto "$p" from "$src" to any port "$port")
+    else
+        UFW_ARGS=(proto "$p" from "$src")
+    fi
+}
+
+fw_rich() {
+    local p port src
+    IFS='|' read -r p port src <<<"$1"
+    if [ -n "$port" ]; then
+        printf 'rule family="ipv4" source address="%s" port port="%s" protocol="%s" accept' "$src" "${port/:/-}" "$p"
+    else
+        printf 'rule family="ipv4" source address="%s" protocol value="%s" accept' "$src" "$p"
+    fi
+}
+
+fw_ipt_args() {
+    local p port src
+    IFS='|' read -r p port src <<<"$1"
+    IPT_ARGS=(INPUT)
+    case $p in
+        gre) IPT_ARGS+=(-p 47) ;;
+        ipv6) IPT_ARGS+=(-p 41) ;;
+        *) IPT_ARGS+=(-p "$p") ;;
+    esac
+    [ -n "$src" ] && IPT_ARGS+=(-s "$src")
+    [ -n "$port" ] && IPT_ARGS+=(--dport "$port")
+    IPT_ARGS+=(-m comment --comment "$2" -j ACCEPT)
+}
+
+fw_ipt_clear() {
+    local cmd line
+    local -a a
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        while IFS= read -r line; do
+            line=${line//\"/}
+            [[ "$line " == *"--comment $1 "* ]] || continue
+            read -ra a <<<"${line/#-A INPUT/-D INPUT}"
+            "$cmd" "${a[@]}" >/dev/null 2>&1
+        done < <("$cmd" -S INPUT 2>/dev/null)
+    done
+}
+
+fw_add() {
+    local kind=$1 spec=$2 out rule port p src
+    IFS='|' read -r p port src <<<"$spec"
+    case $kind in
+        ufw)
+            fw_ufw_args "$spec"
+            out=$(ufw allow "${UFW_ARGS[@]}" 2>&1) || return 1
+            [[ $out == *"Rule added"* ]] && return 0
+            return 2
+            ;;
+        firewalld)
+            if [ -z "$src" ]; then
+                firewall-cmd -q --query-port="${port/:/-}/$p" 2>/dev/null && return 2
+                firewall-cmd -q --add-port="${port/:/-}/$p" && firewall-cmd -q --permanent --add-port="${port/:/-}/$p" && return 0
+                return 1
+            fi
+            rule=$(fw_rich "$spec")
+            firewall-cmd -q --query-rich-rule="$rule" 2>/dev/null && return 2
+            firewall-cmd -q --add-rich-rule="$rule" && firewall-cmd -q --permanent --add-rich-rule="$rule" && return 0
+            return 1
+            ;;
+    esac
+    return 1
+}
+
+fw_del() {
+    local kind=$1 spec=$2 rule port p src
+    IFS='|' read -r p port src <<<"$spec"
+    case $kind in
+        ufw)
+            command -v ufw >/dev/null 2>&1 || return 0
+            fw_ufw_args "$spec"
+            ufw --force delete allow "${UFW_ARGS[@]}" >/dev/null 2>&1
+            ;;
+        firewalld)
+            command -v firewall-cmd >/dev/null 2>&1 || return 0
+            if [ -z "$src" ]; then
+                firewall-cmd -q --remove-port="${port/:/-}/$p" >/dev/null 2>&1
+                firewall-cmd -q --permanent --remove-port="${port/:/-}/$p" >/dev/null 2>&1
+            else
+                rule=$(fw_rich "$spec")
+                firewall-cmd -q --remove-rich-rule="$rule" >/dev/null 2>&1
+                firewall-cmd -q --permanent --remove-rich-rule="$rule" >/dev/null 2>&1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+fw_sync() {
+    local tag=$1 st=$2 quiet=$3 kind line k s rc
+    shift 3
+    local -a want=() have=() keep=() added=() failed=()
+    local -A pre=()
+    for s in "$@"; do
+        [ -n "$s" ] && want+=("$s")
+    done
+    kind=$(fw_kind)
+    [ -f "$st" ] && mapfile -t have <"$st"
+    for line in "${have[@]}"; do
+        [ -n "$line" ] || continue
+        k=${line%%|*}
+        s=${line#*|}
+        if [ "$k" = "$kind" ] && fw_in "$s" "${want[@]}"; then
+            keep+=("$line")
+        else
+            fw_del "$k" "$s"
+        fi
+    done
+    if [ "$kind" = iptables ]; then
+        for s in "${want[@]}"; do
+            fw_ipt_args "$s" "$tag"
+            iptables -C "${IPT_ARGS[@]}" >/dev/null 2>&1 && pre[$s]=1
+        done
+    fi
+    command -v iptables >/dev/null 2>&1 && fw_ipt_clear "$tag"
+    for s in "${want[@]}"; do
+        case $kind in
+            none) ;;
+            iptables)
+                fw_ipt_args "$s" "$tag"
+                if iptables -I "${IPT_ARGS[@]}" >/dev/null 2>&1; then
+                    [ -n "${pre[$s]}" ] || added+=("$(fw_label "$s")")
+                else
+                    failed+=("$(fw_label "$s")")
+                fi
+                [[ $s == *"|" ]] && command -v ip6tables >/dev/null 2>&1 && ip6tables -I "${IPT_ARGS[@]}" >/dev/null 2>&1
+                ;;
+            *)
+                fw_in "$kind|$s" "${keep[@]}" && continue
+                fw_add "$kind" "$s"
+                rc=$?
+                case $rc in
+                    0)
+                        keep+=("$kind|$s")
+                        added+=("$(fw_label "$s")")
+                        ;;
+                    2) ;;
+                    *) failed+=("$(fw_label "$s")") ;;
+                esac
+                ;;
+        esac
+    done
+    if ((${#keep[@]})); then
+        printf '%s\n' "${keep[@]}" >"$st" 2>/dev/null
+    else
+        rm -f "$st"
+    fi
+    [ "$quiet" = q ] && return 0
+    ((${#want[@]})) || return 0
+    local -a labels=()
+    for s in "${want[@]}"; do labels+=("$(fw_label "$s")"); done
+    if [ "$kind" = none ]; then
+        info "No active firewall on this server. If your provider has a firewall panel, open: ${labels[*]}"
+        return 0
+    fi
+    ((${#added[@]})) && ok "Firewall $kind: opened ${added[*]}"
+    ((${#failed[@]})) && warn "Firewall $kind: could not open ${failed[*]}"
+    if ((${#added[@]} == 0 && ${#failed[@]} == 0)); then
+        info "Firewall $kind: needed ports are already open"
+    fi
+    return 0
+}
+
+fw_specs_tunnel() {
+    local tok t
+    local -a toks rules=()
+    if [ "${T[SIDE]}" = server ]; then
+        rules+=("tcp|${T[BIND_PORT]}|")
+        [[ ${T[PROTO]} == kcp || ${T[PROTO]} == quic ]] && rules+=("udp|${T[BIND_PORT]}|")
+    fi
+    if bind_here && [ "${T[LISTEN]}" != local ]; then
+        IFS=, read -ra toks <<<"${T[PORTS]}"
+        for tok in "${toks[@]}"; do
+            for t in tcp udp; do
+                [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] && rules+=("$t|${tok/-/:}|")
+            done
+        done
+    fi
+    ((${#rules[@]})) && printf '%s\n' "${rules[@]}"
+    return 0
+}
+
+fw_specs_lip() {
+    case ${L[TYPE]} in
+        gre) printf 'gre||%s\n' "${L[REMOTE]}" ;;
+        sit) printf 'ipv6||%s\n' "${L[REMOTE]}" ;;
+        vxlan) printf 'udp|%s|%s\n' "${L[DPORT]}" "${L[REMOTE]}" ;;
+    esac
+}
+
+fw_tunnel_apply() {
+    local -a specs=()
+    [ "$2" = clear ] || mapfile -t specs < <(fw_specs_tunnel)
+    fw_sync "frp-tunnel:$1" "$TUN_DIR/$1/fw.state" "$3" "${specs[@]}"
+}
+
+fw_lip_apply() {
+    local -a specs=()
+    [ "$2" = clear ] || mapfile -t specs < <(fw_specs_lip)
+    fw_sync "frp-tunnel-lip:$1" "$LIP_DIR/$1.fw" "$3" "${specs[@]}"
+}
+
+fw_cli() {
+    case $1 in
+        --fw-sync)
+            tunnel_load "$2" && fw_tunnel_apply "$2" sync q
+            ;;
+        --fw-sync-lip)
+            lip_load_file "$LIP_DIR/$2.conf" && fw_lip_apply "$2" sync q
+            ;;
+    esac
+    return 0
+}
+
+fw_exec_pre() {
+    [ -x "$SELF_BIN" ] && printf 'ExecStartPre=-%s %s %s\n' "$SELF_BIN" "$1" "$2"
+    return 0
+}
+
+META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE LISTEN TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP CREATED)
 
 tunnel_names() {
     local f
@@ -1275,7 +1538,11 @@ gen_frps() {
         [ "${T[PROTO]}" = kcp ] && printf 'kcpBindPort = %s\n' "${T[BIND_PORT]}"
         [ "${T[PROTO]}" = quic ] && printf 'quicBindPort = %s\n' "${T[BIND_PORT]}"
     fi
-    printf 'proxyBindAddr = "0.0.0.0"\n'
+    if [ "${T[LISTEN]}" = local ]; then
+        printf 'proxyBindAddr = "127.0.0.1"\n'
+    else
+        printf 'proxyBindAddr = "0.0.0.0"\n'
+    fi
     toml_transport
     printf 'transport.maxPoolCount = %s\n' "${T[POOL]}"
     printf 'transport.heartbeatTimeout = %s\n' "$(hb_val "${T[HB_TO]}")"
@@ -1344,12 +1611,13 @@ gen_proxies() {
 }
 
 gen_visitors() {
-    local p t typ
+    local p t typ ba=0.0.0.0
+    [ "${T[LISTEN]}" = local ] && ba=127.0.0.1
     for t in tcp udp; do
         [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] || continue
         if [ "$t" = tcp ]; then typ=stcp; else typ=sudp; fi
         for p in "${PORT_LIST[@]}"; do
-            printf '\n[[visitors]]\nname = "%s-v%s-%s"\ntype = "%s"\nserverName = "%s-%s-%s"\nsecretKey = "%s"\nbindAddr = "0.0.0.0"\nbindPort = %s\n' "${T[PFX]}" "$typ" "$p" "$typ" "${T[PFX]}" "$typ" "$p" "${T[SK]}" "$p"
+            printf '\n[[visitors]]\nname = "%s-v%s-%s"\ntype = "%s"\nserverName = "%s-%s-%s"\nsecretKey = "%s"\nbindAddr = "%s"\nbindPort = %s\n' "${T[PFX]}" "$typ" "$p" "$typ" "${T[PFX]}" "$typ" "$p" "${T[SK]}" "$ba" "$p"
             [ "${T[COMPRESS]}" = y ] && printf 'transport.useCompression = true\n'
         done
     done
@@ -1449,6 +1717,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+$(fw_exec_pre --fw-sync "$n")
 ExecStart=$bin -c $cfg
 Restart=always
 RestartSec=3
@@ -1469,6 +1738,7 @@ tunnel_defaults() {
     T[RESTRICT]=${T[RESTRICT]:-y}
     T[BIND_ADDR]=${T[BIND_ADDR]:-0.0.0.0}
     T[PTYPE]=${T[PTYPE]:-tcp}
+    T[LISTEN]=${T[LISTEN]:-public}
     T[MTLS]=${T[MTLS]:-n}
 }
 
@@ -1529,6 +1799,7 @@ tunnel_apply() {
         fi
     done
     ok "Config files verified"
+    fw_tunnel_apply "$n" sync
     write_units
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "frp-$n.service" >/dev/null 2>&1
@@ -1546,6 +1817,7 @@ tunnel_apply() {
 
 tunnel_remove() {
     local n=$1 u
+    fw_tunnel_apply "$n" clear q
     for u in "frp-$n.service" "frp-$n-provider.service" "frp-$n-wss.service"; do
         systemctl disable --now "$u" >/dev/null 2>&1
         rm -f "$UNIT_DIR/$u"
@@ -1622,15 +1894,22 @@ key_prompt() {
     cnext
     c=$NC
     while :; do
-        printf '  \e[38;5;%sm%s\e[0m\n  ' "$c" "Paste the connection key, empty to skip:"
+        printf '  \e[38;5;%sm%s\e[0m\n  ' "$c" "Connection key from the $(other_role) server, Enter to skip:"
         if ! IFS= read -r -e k; then
             printf '\e[0m\n'
             exit 0
         fi
         k=${k//[[:space:]]/}
         [ -z "$k" ] && return 1
-        key_parse "$k" && return 0
-        err "Invalid connection key"
+        if ! key_parse "$k"; then
+            err "Invalid connection key"
+            continue
+        fi
+        if [ "${K[ROLE]}" = "${T[ROLE]}" ]; then
+            err "This key was made on the $(side_role "${K[ROLE]}") server. Paste the key from the $(other_role) server."
+            continue
+        fi
+        return 0
     done
 }
 
@@ -1691,10 +1970,10 @@ key_show() {
     k=$(key_make)
     printf '%s\n' "$k" >"$f"
     chmod 600 "$f"
-    section "Connection key for the other server"
+    section "Connection key for the $(other_role) server"
     cnext
     printf '\n\e[38;5;%sm%s\e[0m\n\n' "$NC" "$k"
-    info "On the other server: Create tunnel > Import connection key"
+    info "On the $(other_role) server: Create tunnel, then paste this key"
     info "Saved to $f"
     warn "Keep this key private. It contains the token and certificates."
 }
@@ -1779,6 +2058,9 @@ next_name() {
     printf 'tun%s' "$i"
 }
 
+side_role() { if [ "$1" = iran ]; then printf 'Iran'; else printf 'Kharej'; fi; }
+other_role() { if [ "${T[ROLE]}" = iran ]; then printf 'Kharej'; else printf 'Iran'; fi; }
+
 step_name() {
     local d=${K[NAME]}
     { [ -z "$d" ] || [ -e "$TUN_DIR/$d" ]; } && d=$(next_name)
@@ -1787,23 +2069,23 @@ step_name() {
 
 step_role() {
     local c
-    choose c "This server is" 1 "Iran" "Foreign"
+    choose c "This server is" 1 "Iran" "Kharej"
     if [ "$c" = 1 ]; then T[ROLE]=iran; else T[ROLE]=foreign; fi
 }
 
 step_mode() {
     local c
-    choose c "Tunnel mode" 1 "Reverse (Foreign connects to Iran)" "Direct (Iran connects to Foreign)"
+    choose c "Tunnel mode" 1 "Reverse (Kharej connects to Iran)" "Direct (Iran connects to Kharej)"
     if [ "$c" = 1 ]; then T[MODE]=reverse; else T[MODE]=direct; fi
     derive_side
     if [ "${T[MODE]}" = direct ]; then
-        choose c "Direct method" 1 "STCP visitor (Foreign ports on Iran)" "Plain proxy (Iran ports on Foreign)"
+        choose c "Direct method" 1 "STCP (Kharej ports on Iran)" "Plain proxy (Iran ports on Kharej)"
         if [ "$c" = 1 ]; then T[METHOD]=stcp; else T[METHOD]=proxy; fi
     fi
     if [ "${T[SIDE]}" = server ]; then
-        info "This server runs frps (server side)"
+        info "This server waits for the $(other_role) server to connect"
     else
-        info "This server runs frpc (client side)"
+        info "This server connects to the $(other_role) server"
     fi
 }
 
@@ -1811,7 +2093,7 @@ step_proto() {
     local c d=1 i
     local -a p=(tcp kcp quic websocket wss)
     for i in "${!p[@]}"; do [ "${p[i]}" = "${T[PROTO]}" ] && d=$((i + 1)); done
-    choose c "Transport protocol" "$d" "tcp" "kcp" "quic" "websocket" "wss"
+    choose c "Tunnel protocol" "$d" "tcp" "kcp" "quic" "websocket" "wss"
     T[PROTO]=${p[c - 1]}
 }
 
@@ -1839,11 +2121,12 @@ lip_pick_addr() {
 }
 
 step_endpoint() {
-    local d
+    local d me
+    me=$(side_role "${T[ROLE]}")
     if [ "${T[SIDE]}" = server ]; then
         T[BIND_ADDR]=${T[BIND_ADDR]:-0.0.0.0}
         if lip_any; then
-            if confirm "Accept FRP connections only on a local IP?" "$([ -n "${T[LIP]}" ] && echo y || echo n)"; then
+            if confirm "Accept tunnel connections only on a local IP?" "$([ -n "${T[LIP]}" ] && echo y || echo n)"; then
                 lip_pick_addr own && T[BIND_ADDR]=$LIP_ADDR
             else
                 T[BIND_ADDR]=0.0.0.0
@@ -1856,27 +2139,31 @@ step_endpoint() {
         esac
         d=${T[BIND_PORT]}
         [ -z "$d" ] && { if [ "${T[PROTO]}" = wss ]; then d=8443; else d=7000; fi; }
-        ask "T[BIND_PORT]" "FRP port" "$d" v_bind_port "-"
+        ask "T[BIND_PORT]" "Tunnel port" "$d" v_bind_port "-"
         if [ "${T[BIND_ADDR]}" != 0.0.0.0 ]; then
             d=${T[BIND_ADDR]}
         else
             d=${T[PUB_ADDR]}
             [ -z "$d" ] && get_public_ip && d=$PUBIP
         fi
-        ask "T[PUB_ADDR]" "Address clients connect to" "$d" is_host "Enter a valid IP or domain"
+        ask "T[PUB_ADDR]" "$me IP" "$d" is_host "Enter a valid IP or domain"
     else
         if lip_any && confirm "Connect through a local IP?" "$([ -n "${T[LIP]}" ] && echo y || echo n)"; then
             lip_pick_addr peer && T[SERVER_ADDR]=$LIP_ADDR
         else
             T[LIP]=""
-            ask "T[SERVER_ADDR]" "Server address" "${T[SERVER_ADDR]}" is_host "Enter a valid IP or domain"
+            ask "T[SERVER_ADDR]" "$(other_role) IP" "${T[SERVER_ADDR]}" is_host "Enter a valid IP or domain"
         fi
-        ask "T[SERVER_PORT]" "Server port" "${T[SERVER_PORT]:-7000}" is_port "Port must be between 1 and 65535"
+        ask "T[SERVER_PORT]" "Tunnel port" "${T[SERVER_PORT]:-7000}" is_port "Port must be between 1 and 65535"
     fi
 }
 
 step_token() {
-    ask "T[TOKEN]" "Auth token" "${T[TOKEN]:-$(rand_str 32)}" is_token "Use 8-128 characters: A-Z a-z 0-9 . _ -"
+    if [ "${T[SIDE]}" = server ]; then
+        ask "T[TOKEN]" "Tunnel token" "${T[TOKEN]:-$(rand_str 32)}" is_token "Use 8-128 characters: A-Z a-z 0-9 . _ -"
+    else
+        ask "T[TOKEN]" "Tunnel token from the $(other_role) server" "${T[TOKEN]}" is_token "Use 8-128 characters: A-Z a-z 0-9 . _ -"
+    fi
 }
 
 tls_self() {
@@ -1906,7 +2193,7 @@ tls_self() {
         info "Using local certificate set '${T[CERT_REF]}'"
         return 0
     fi
-    info "Tip: importing the server connection key sets this up automatically"
+    info "Tip: pasting the connection key of the $(other_role) server sets this up automatically"
     mkdir -p "$d"
     chmod 700 "$d"
     ask f "CA certificate file, empty = no verify" "$([ -f "$d/ca.crt" ] && echo "$d/ca.crt")" "?is_cert_file" "Not a valid certificate file"
@@ -1950,7 +2237,7 @@ tls_le() {
         tls_fallback
         return
     fi
-    ask "T[CERT_REF]" "Server domain" "${T[CERT_REF]}" is_domain "Enter a valid domain like tunnel.example.com"
+    ask "T[CERT_REF]" "Domain of the $(other_role) server" "${T[CERT_REF]}" is_domain "Enter a valid domain like tunnel.example.com"
 }
 
 step_tls() {
@@ -1963,7 +2250,7 @@ step_tls() {
             [ "${T[CERT_MODE]}" = le ] && d=2
             choose c "Certificate" "$d" "Self-signed" "Let's Encrypt"
             if [ "$c" = 1 ]; then T[CERT_MODE]=self; else T[CERT_MODE]=le; fi
-        elif confirm "Enable TLS?" "$([ "${T[TLS]}" = n ] && echo n || echo y)"; then
+        elif confirm "Encrypt the tunnel with TLS?" "$([ "${T[TLS]}" = n ] && echo n || echo y)"; then
             T[TLS]=y
             case ${T[CERT_MODE]} in self) d=2 ;; le) d=3 ;; *) d=1 ;; esac
             choose c "Certificate" "$d" "Built-in FRP" "Self-signed" "Let's Encrypt"
@@ -1990,12 +2277,27 @@ step_tls() {
     esac
 }
 
+step_port_type() {
+    local c d=1
+    case ${T[PTYPE]} in udp) d=2 ;; both) d=3 ;; esac
+    choose c "VPN config port type" "$d" "TCP" "UDP" "TCP + UDP"
+    case $c in
+        1) T[PTYPE]=tcp ;;
+        2) T[PTYPE]=udp ;;
+        3) T[PTYPE]=both ;;
+    esac
+}
+
+step_service_ip() {
+    has_proxies_here || return 0
+    ask "T[TARGET_IP]" "VPN service IP" "${T[TARGET_IP]:-127.0.0.1}" is_ip "Enter a valid IP"
+}
+
 step_advanced() {
-    local force=$1
     tunnel_defaults
-    if [ "$force" != y ]; then
-        confirm "Customize advanced options?" n || return 0
-    fi
+    step_tls n || return 1
+    step_port_type
+    step_service_ip
     if confirm "Enable tcpMux?" "${T[TCPMUX]}"; then T[TCPMUX]=y; else T[TCPMUX]=n; fi
     if confirm "Enable compression?" "${T[COMPRESS]}"; then T[COMPRESS]=y; else T[COMPRESS]=n; fi
     ask "T[POOL]" "Pool count" "${T[POOL]}" v_pool "Enter a number from 0 to 100"
@@ -2004,33 +2306,35 @@ step_advanced() {
     if [ "${T[HB_INT]}" != 0 ] && [ "${T[HB_TO]}" != 0 ] && ((10#${T[HB_TO]} <= 10#${T[HB_INT]})); then
         warn "Heartbeat timeout should be larger than the interval"
     fi
-    step_target_ip
     if [ "${T[SIDE]}" = server ] && [ "${T[METHOD]}" != stcp ]; then
-        if confirm "Allow only the listed ports on the server?" "${T[RESTRICT]}"; then T[RESTRICT]=y; else T[RESTRICT]=n; fi
+        if confirm "Allow only the listed VPN config ports on this server?" "${T[RESTRICT]}"; then T[RESTRICT]=y; else T[RESTRICT]=n; fi
     fi
+    return 0
 }
 
-step_target_ip() {
-    has_proxies_here || return 0
-    ask "T[TARGET_IP]" "Target service IP" "${T[TARGET_IP]:-127.0.0.1}" is_ip "Enter a valid IP"
+step_listen() {
+    local c d=1
+    if ! bind_here; then
+        T[LISTEN]=public
+        return 0
+    fi
+    [ "${T[LISTEN]}" = local ] && d=2
+    choose c "Who connects to the VPN config ports" "$d" "VPN users (open to the internet)" "Only the panel on this server (127.0.0.1)"
+    if [ "$c" = 2 ]; then T[LISTEN]=local; else T[LISTEN]=public; fi
 }
 
 step_ports() {
-    local c d=1
-    case ${T[PTYPE]} in udp) d=2 ;; both) d=3 ;; esac
-    choose c "Port type" "$d" "TCP" "UDP" "TCP + UDP"
-    case $c in
-        1) T[PTYPE]=tcp ;;
-        2) T[PTYPE]=udp ;;
-        3) T[PTYPE]=both ;;
-    esac
     blank
     if bind_here; then
-        info "Ports that will be opened on this server"
-        ask "T[PORTS]" "Ports, e.g. 443,2000-2010" "${T[PORTS]}" v_ports_bind "-"
+        if [ "${T[LISTEN]}" = local ]; then
+            info "These ports will be available on 127.0.0.1 of this server"
+        else
+            info "These ports will be opened on this server for VPN users"
+        fi
+        ask "T[PORTS]" "VPN config ports, e.g. 443,8080,2000-2010" "${T[PORTS]}" v_ports_bind "-"
     else
-        info "Ports of the services on this server to forward"
-        ask "T[PORTS]" "Ports, e.g. 443,2000-2010" "${T[PORTS]}" v_ports_target "-"
+        info "Ports of the VPN configs (inbounds) running on this server"
+        ask "T[PORTS]" "VPN config ports, e.g. 443,8080,2000-2010" "${T[PORTS]}" v_ports_target "-"
     fi
     parse_ports "${T[PORTS]}"
     T[PORTS]=$(ports_compact)
@@ -2051,61 +2355,49 @@ tls_label() {
 
 mode_label() {
     if [ "${T[MODE]}" = reverse ]; then
-        printf 'Reverse'
+        printf 'Reverse, Kharej connects to Iran'
     elif [ "${T[METHOD]}" = stcp ]; then
-        printf 'Direct, STCP visitor'
+        printf 'Direct STCP, Iran connects to Kharej'
     else
-        printf 'Direct, plain proxy'
+        printf 'Direct plain proxy, Iran connects to Kharej'
     fi
 }
 
 endpoint_label() {
     if [ "${T[SIDE]}" = server ]; then
-        printf 'listen %s:%s' "${T[BIND_ADDR]}" "${T[BIND_PORT]}"
+        printf 'port %s, %s IP %s' "${T[BIND_PORT]}" "$(side_role "${T[ROLE]}")" "${T[PUB_ADDR]}"
     else
-        printf 'connect %s:%s' "${T[SERVER_ADDR]}" "${T[SERVER_PORT]}"
+        printf '%s IP %s, port %s' "$(other_role)" "${T[SERVER_ADDR]}" "${T[SERVER_PORT]}"
     fi
+}
+
+adv_label() {
+    printf 'mux %s, zip %s, pool %s, heartbeat %s/%s' "$(yn "${T[TCPMUX]}")" "$(yn "${T[COMPRESS]}")" "${T[POOL]}" "${T[HB_INT]}" "${T[HB_TO]}"
 }
 
 tunnel_summary() {
     section "Summary"
-    kv "Name" "${T[NAME]}"
-    kv "This server" "${T[ROLE]^}, $([ "${T[SIDE]}" = server ] && echo 'frps' || echo 'frpc')"
+    kv "Tunnel name" "${T[NAME]}"
+    kv "This server" "$(side_role "${T[ROLE]}"), $([ "${T[SIDE]}" = server ] && echo 'tunnel server' || echo 'tunnel client')"
     kv "Mode" "$(mode_label)"
-    kv "Protocol" "${T[PROTO]}"
-    kv "Endpoint" "$(endpoint_label)"
-    [ "${T[SIDE]}" = server ] && kv "Public address" "${T[PUB_ADDR]}"
-    [ -n "${T[LIP]}" ] && kv "Local IP link" "${T[LIP]}"
-    kv "Token" "${T[TOKEN]}"
-    kv "TLS" "$(tls_label)"
-    kv "Ports" "${T[PORTS]} ${T[PTYPE]}"
-    has_proxies_here && kv "Target IP" "${T[TARGET_IP]}"
-    kv "tcpMux / compression" "$(yn "${T[TCPMUX]}") / $(yn "${T[COMPRESS]}")"
-    kv "Pool / heartbeat" "${T[POOL]} / ${T[HB_INT]}s, ${T[HB_TO]}s"
-}
-
-ufw_offer() {
-    ufw_active || return 0
-    local -a rules=()
-    local r t tok
-    local -a toks
+    kv "Tunnel protocol" "${T[PROTO]}"
     if [ "${T[SIDE]}" = server ]; then
-        rules+=("${T[BIND_PORT]}/tcp")
-        [[ ${T[PROTO]} == kcp || ${T[PROTO]} == quic ]] && rules+=("${T[BIND_PORT]}/udp")
+        kv "Tunnel port" "${T[BIND_PORT]}"
+        kv "$(side_role "${T[ROLE]}") IP" "${T[PUB_ADDR]}"
+        [ "${T[BIND_ADDR]}" != 0.0.0.0 ] && kv "Listen on" "${T[BIND_ADDR]}"
+    else
+        kv "$(other_role) IP" "${T[SERVER_ADDR]}"
+        kv "Tunnel port" "${T[SERVER_PORT]}"
     fi
+    [ -n "${T[LIP]}" ] && kv "Local IP link" "${T[LIP]}"
+    kv "Tunnel token" "${T[TOKEN]}"
+    kv "TLS" "$(tls_label)"
+    kv "VPN config ports" "${T[PORTS]} ${T[PTYPE]}"
     if bind_here; then
-        IFS=, read -ra toks <<<"${T[PORTS]}"
-        for tok in "${toks[@]}"; do
-            for t in tcp udp; do
-                [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] && rules+=("${tok/-/:}/$t")
-            done
-        done
+        if [ "${T[LISTEN]}" = local ]; then kv "VPN ports access" "127.0.0.1 only"; else kv "VPN ports access" "open to the internet"; fi
     fi
-    ((${#rules[@]})) || return 0
-    confirm "UFW is active. Open the required ports?" y || return 0
-    for r in "${rules[@]}"; do
-        if ufw allow "$r" >/dev/null 2>&1; then ok "UFW allow $r"; else warn "Could not add UFW rule $r"; fi
-    done
+    has_proxies_here && kv "VPN service IP" "${T[TARGET_IP]}"
+    kv "Advanced" "$(adv_label)"
 }
 
 net_offer() {
@@ -2117,42 +2409,56 @@ net_offer() {
 }
 
 tunnel_create() {
-    local fk=n
+    local fk=n adv=n
     need_frp || return
     header "CREATE TUNNEL"
     T=()
     K=()
     EXCL=()
-    if confirm "Import a connection key from the other server?" n; then
-        if key_prompt; then
-            fk=y
-            key_apply
-            ok "Key accepted: $(mode_label), this server is ${T[ROLE]^} (${T[SIDE]})"
-        fi
+    step_role
+    blank
+    if key_prompt; then
+        fk=y
+        key_apply
+        ok "Key accepted: $(mode_label)"
     fi
     step_name
     if [ "$fk" = n ]; then
-        step_role
-        step_mode
-        step_proto
+        T[MODE]=reverse
+        derive_side
+        T[PROTO]=tcp
+        T[TLS]=y
+        T[CERT_MODE]=builtin
+        if confirm "Advanced settings?" n; then
+            adv=y
+            section "Advanced"
+            step_mode
+            step_proto
+        fi
     fi
     section "Connection"
     step_endpoint
-    [ "$fk" = n ] && step_token
-    section "Security"
-    if ! step_tls "$fk"; then
+    if [ "$fk" = n ]; then
+        if [ "${T[SIDE]}" = client ] || [ "$adv" = y ]; then
+            step_token
+        else
+            T[TOKEN]=$(rand_str 32)
+        fi
+    fi
+    if [ "$adv" = y ]; then
+        section "Advanced"
+        if ! step_advanced; then
+            err "TLS setup failed, tunnel was not created"
+            pause
+            return
+        fi
+    elif [ "$fk" = y ] && ! step_tls y; then
         err "TLS setup failed, tunnel was not created"
         pause
         return
     fi
-    if [ "$fk" = n ]; then
-        section "Options"
-        step_advanced
-    else
-        tunnel_defaults
-        step_target_ip
-    fi
-    section "Ports"
+    section "VPN configs"
+    step_listen
     step_ports
     tunnel_defaults
     tunnel_summary
@@ -2165,8 +2471,11 @@ tunnel_create() {
     blank
     if tunnel_apply; then
         ok "Tunnel '${T[NAME]}' created"
-        ufw_offer
-        key_show
+        if [ "$fk" = n ]; then
+            key_show
+        else
+            info "Done. No need to paste anything on the $(other_role) server."
+        fi
         net_offer
     else
         err "Tunnel files were saved but the service was not started. Use Edit to fix it."
@@ -2182,7 +2491,7 @@ tunnel_table() {
         return 1
     fi
     cnext
-    printf '  \e[1;38;5;%sm%-3s %-12s %-8s %-8s %-9s %-14s %-9s %s\e[0m\n' "$NC" "#" "NAME" "ROLE" "MODE" "PROTO" "PORTS" "STATUS" "BOOT"
+    printf '  \e[1;38;5;%sm%-3s %-12s %-8s %-8s %-9s %-14s %-9s %s\e[0m\n' "$NC" "#" "NAME" "SERVER" "MODE" "PROTO" "VPN PORTS" "STATUS" "BOOT"
     for i in "${!TNAMES[@]}"; do
         n=${TNAMES[i]}
         tunnel_load "$n" || continue
@@ -2190,7 +2499,7 @@ tunnel_table() {
         en=$(svc_enabled "frp-$n.service")
         cnext
         printf '  \e[38;5;%sm%-3s %-12s %-8s %-8s %-9s %-14s\e[0m \e[38;5;%sm%-9s\e[0m\e[38;5;%sm%s\e[0m\n' \
-            "$NC" "$((i + 1))" "$n" "${T[ROLE]}" "${T[MODE]}" "${T[PROTO]}" "$(trunc "${T[PORTS]}" 14)" \
+            "$NC" "$((i + 1))" "$n" "$(side_role "${T[ROLE]}")" "${T[MODE]}" "${T[PROTO]}" "$(trunc "${T[PORTS]}" 14)" \
             "$(state_color "$st")" "$st" "$(state_color "$en")" "$en"
     done
     return 0
@@ -2268,42 +2577,38 @@ tunnel_edit() {
     for c in "${T[BIND_PORT]}" "${T[INT_PORT]}"; do [ -n "$c" ] && EXCL[$c]=1; done
     while :; do
         header "EDIT: $n"
-        item 1 "Protocol         ${T[PROTO]}"
-        item 2 "Endpoint         $(endpoint_label)"
-        item 3 "Token            ${T[TOKEN]:0:12}..."
-        item 4 "TLS              $(tls_label)"
-        item 5 "Ports            ${T[PORTS]} ${T[PTYPE]}"
-        item 6 "Advanced         mux $(yn "${T[TCPMUX]}"), zip $(yn "${T[COMPRESS]}"), pool ${T[POOL]}"
-        item 7 "Save and apply"
+        item 1 "Tunnel port & IP     $(endpoint_label)"
+        item 2 "VPN config ports     ${T[PORTS]} ${T[PTYPE]}"
+        item 3 "Advanced settings    ${T[PROTO]}, TLS $(tls_label)"
+        item 4 "Save and apply"
         item 0 "Cancel"
-        menu_pick c 7
+        menu_pick c 4
         blank
         case $c in
-            1)
+            1) step_endpoint ;;
+            2)
+                step_listen
+                step_ports
+                ;;
+            3)
                 old=${T[PROTO]}
                 step_proto
                 if [ "$old" != "${T[PROTO]}" ]; then
                     [ "${T[SIDE]}" = server ] && step_endpoint
-                    if [ "${T[PROTO]}" = wss ] || [ "$old" = wss ]; then
-                        T[_OLD_CERT]=${T[CERT_MODE]}
-                        step_tls n || warn "TLS setup failed"
-                    fi
                     [ "${T[PROTO]}" = wss ] || T[INT_PORT]=""
                 fi
-                ;;
-            2) step_endpoint ;;
-            3) step_token ;;
-            4)
+                step_token
                 T[_OLD_CERT]=${T[CERT_MODE]}
-                step_tls n || warn "TLS setup failed"
-                ;;
-            5) step_ports ;;
-            6) step_advanced y ;;
-            7)
+                if ! step_advanced; then
+                    warn "TLS setup failed"
+                    pause
+                fi
                 unset 'T[_OLD_CERT]'
+                ;;
+            4)
                 if tunnel_apply; then
                     ok "Tunnel '$n' updated"
-                    warn "Apply the same change on the other server, or import this key there"
+                    warn "Make the same change on the $(other_role) server with Edit, or delete the tunnel there and create it again with this key"
                     key_show
                 fi
                 pause
@@ -2456,6 +2761,8 @@ v_remote_ip() {
 }
 
 v_iface() { ip link show "$1" >/dev/null 2>&1; }
+lip_me() { if [ "${L[ROLE]}" = iran ]; then printf 'Iran'; else printf 'Kharej'; fi; }
+lip_other() { if [ "${L[ROLE]}" = iran ]; then printf 'Kharej'; else printf 'Iran'; fi; }
 
 lip_mtu_calc() {
     local dev=${L[DEV]:-$(default_iface)} m=1500 o=24
@@ -2567,6 +2874,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+$(fw_exec_pre --fw-sync-lip "${L[NAME]}")
 ExecStart=$LIP_DIR/${L[NAME]}.sh up
 ExecStop=$LIP_DIR/${L[NAME]}.sh down
 
@@ -2584,6 +2892,7 @@ lip_apply() {
     chmod 600 "$LIP_DIR/$n.conf"
     chmod 755 "$LIP_DIR/$n.sh"
     lip_unit >"$UNIT_DIR/frp-lip-$n.service"
+    fw_lip_apply "$n" sync
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "frp-lip-$n.service" >/dev/null 2>&1
     systemctl restart "frp-lip-$n.service" >/dev/null 2>&1
@@ -2624,22 +2933,12 @@ lip_ping() {
     fi
 }
 
-lip_ufw() {
-    ufw_active || return 0
-    confirm "UFW is active. Allow ${L[TYPE]} traffic from ${L[REMOTE]}?" y || return 0
-    case ${L[TYPE]} in
-        gre) ufw allow proto gre from "${L[REMOTE]}" >/dev/null 2>&1 ;;
-        sit) ufw allow proto ipv6 from "${L[REMOTE]}" >/dev/null 2>&1 ;;
-        vxlan) ufw allow proto udp from "${L[REMOTE]}" to any port "${L[DPORT]}" >/dev/null 2>&1 ;;
-    esac && ok "UFW rule added" || warn "Could not add the UFW rule"
-}
-
 lip_create() {
     local c d
     header "CREATE LOCAL IP"
     L=()
     ask "L[NAME]" "Name" "$(lip_next_name)" v_new_lip "-"
-    choose c "Type" 1 "GRE (IPv4)" "SIT / 6to4 (IPv6)" "VXLAN (IPv4)"
+    choose c "Local IP type" 1 "GRE (IPv4)" "SIT / 6to4 (IPv6)" "VXLAN (IPv4)"
     case $c in
         1)
             L[TYPE]=gre
@@ -2654,26 +2953,26 @@ lip_create() {
             L[IFACE]="fvx-${L[NAME]}"
             ;;
     esac
-    choose c "This server is" 1 "Iran" "Foreign"
+    choose c "This server is" 1 "Iran" "Kharej"
     if [ "$c" = 1 ]; then L[ROLE]=iran; else L[ROLE]=foreign; fi
-    section "Public addresses"
-    ask "L[LOCAL]" "This server IPv4" "$(detect_ip4)" is_ipv4 "Enter a valid IPv4"
+    section "Public IPs"
+    ask "L[LOCAL]" "$(lip_me) IP" "$(detect_ip4)" is_ipv4 "Enter a valid IPv4"
     ip -4 addr show 2>/dev/null | grep -q "inet ${L[LOCAL]}/" || warn "${L[LOCAL]} is not assigned to any interface here"
-    ask "L[REMOTE]" "Other server IPv4" "" v_remote_ip "-"
+    ask "L[REMOTE]" "$(lip_other) IP" "" v_remote_ip "-"
     lip_suggest "${L[LOCAL]}" "${L[REMOTE]}"
-    section "Private addresses"
+    section "Local IPs"
     info "Suggested values match on both servers automatically"
     if [ "${L[TYPE]}" != sit ]; then
-        ask "L[V4]" "Local IPv4" "$SUG_MY4" v_addr4 "Enter an IPv4 like 10.20.30.1/30"
+        ask "L[V4]" "$(lip_me) local IPv4" "$SUG_MY4" v_addr4 "Enter an IPv4 like 10.20.30.1/30"
         [[ ${L[V4]} == */* ]] || L[V4]="${L[V4]}/30"
-        ask "L[PEER4]" "Peer IPv4" "$SUG_PEER4" is_ipv4 "Enter a valid IPv4"
+        ask "L[PEER4]" "$(lip_other) local IPv4" "$SUG_PEER4" is_ipv4 "Enter a valid IPv4"
         if confirm "Add IPv6 too?" n; then
-            ask "L[V6]" "Local IPv6" "$SUG_MY6" v_addr6 "Enter an IPv6 like fd00:1::1/64"
-            ask "L[PEER6]" "Peer IPv6" "$SUG_PEER6" is_ipv6 "Enter a valid IPv6"
+            ask "L[V6]" "$(lip_me) local IPv6" "$SUG_MY6" v_addr6 "Enter an IPv6 like fd00:1::1/64"
+            ask "L[PEER6]" "$(lip_other) local IPv6" "$SUG_PEER6" is_ipv6 "Enter a valid IPv6"
         fi
     else
-        ask "L[V6]" "Local IPv6" "$SUG_MY6" v_addr6 "Enter an IPv6 like fd00:1::1/64"
-        ask "L[PEER6]" "Peer IPv6" "$SUG_PEER6" is_ipv6 "Enter a valid IPv6"
+        ask "L[V6]" "$(lip_me) local IPv6" "$SUG_MY6" v_addr6 "Enter an IPv6 like fd00:1::1/64"
+        ask "L[PEER6]" "$(lip_other) local IPv6" "$SUG_PEER6" is_ipv6 "Enter a valid IPv6"
     fi
     [ -n "${L[V6]}" ] && [[ ${L[V6]} != */* ]] && L[V6]="${L[V6]}/64"
     section "Link"
@@ -2694,9 +2993,10 @@ lip_create() {
     section "Summary"
     kv "Name / interface" "${L[NAME]} / ${L[IFACE]}"
     kv "Type" "${L[TYPE]}"
-    kv "Public" "${L[LOCAL]} -> ${L[REMOTE]}"
-    [ -n "${L[V4]}" ] && kv "IPv4" "${L[V4]}  peer ${L[PEER4]}"
-    [ -n "${L[V6]}" ] && kv "IPv6" "${L[V6]}  peer ${L[PEER6]}"
+    kv "$(lip_me) IP" "${L[LOCAL]}"
+    kv "$(lip_other) IP" "${L[REMOTE]}"
+    [ -n "${L[V4]}" ] && kv "Local IPv4" "${L[V4]}, $(lip_other) ${L[PEER4]}"
+    [ -n "${L[V6]}" ] && kv "Local IPv6" "${L[V6]}, $(lip_other) ${L[PEER6]}"
     kv "MTU" "${L[MTU]}"
     [ "${L[TYPE]}" = vxlan ] && kv "VXLAN" "id ${L[VNI]}, port ${L[DPORT]}, dev ${L[DEV]}"
     blank
@@ -2707,8 +3007,7 @@ lip_create() {
     fi
     blank
     if lip_apply; then
-        lip_ufw
-        info "Run the same setup on the other server with role $([ "${L[ROLE]}" = iran ] && echo Foreign || echo Iran)"
+        info "Run the same setup on the $(lip_other) server, the suggested values will match"
         confirm "Test with ping now?" y && lip_ping
     fi
     pause
@@ -2722,7 +3021,7 @@ lip_table() {
         return 1
     fi
     cnext
-    printf '  \e[1;38;5;%sm%-3s %-10s %-6s %-23s %-23s %s\e[0m\n' "$NC" "#" "NAME" "TYPE" "LOCAL" "PEER" "STATE"
+    printf '  \e[1;38;5;%sm%-3s %-10s %-6s %-23s %-23s %s\e[0m\n' "$NC" "#" "NAME" "TYPE" "THIS SERVER" "OTHER SERVER" "STATE"
     for i in "${!LNAMES[@]}"; do
         lip_load_file "$LIP_DIR/${LNAMES[i]}.conf" || continue
         if ip link show "${L[IFACE]}" 2>/dev/null | grep -q 'UP'; then st=up; else st=down; fi
@@ -2796,6 +3095,7 @@ lip_menu() {
                         u=$(lip_users "$n")
                         [ -n "$u" ] && warn "Used by tunnels: $u"
                         if confirm "Delete local IP '$n'?" n; then
+                            fw_lip_apply "$n" clear q
                             systemctl disable --now "frp-lip-$n.service" >/dev/null 2>&1
                             [ -x "$LIP_DIR/$n.sh" ] && "$LIP_DIR/$n.sh" down
                             rm -f "$UNIT_DIR/frp-lip-$n.service" "$LIP_DIR/$n.conf" "$LIP_DIR/$n.sh"
@@ -3135,6 +3435,7 @@ uninstall_all() {
     done < <(tunnel_names)
     while read -r n; do
         [ -n "$n" ] || continue
+        fw_lip_apply "$n" clear q
         systemctl disable --now "frp-lip-$n.service" >/dev/null 2>&1
         [ -x "$LIP_DIR/$n.sh" ] && "$LIP_DIR/$n.sh" down
         rm -f "$UNIT_DIR/frp-lip-$n.service"
@@ -3206,6 +3507,14 @@ usage() {
 
 main() {
     case $1 in
+        --fw-sync)
+            [ "$(id -u)" -eq 0 ] && is_name "$2" && fw_cli "$1" "$2"
+            exit 0
+            ;;
+        --fw-sync-lip)
+            [ "$(id -u)" -eq 0 ] && is_lip_name "$2" && fw_cli "$1" "$2"
+            exit 0
+            ;;
         -v | --version)
             printf '%s\n' "$APP_VER"
             exit 0
