@@ -34,8 +34,8 @@ XRAY_CONF="$XRAY_DIR/config.json"
 XRAY_SVC="frp-tunnel-xray-exit.service"
 XEXIT_DIR="$BASE_DIR/exits"
 GKEY_PREFIX="frptx1:"
-XPROBE_URL="https://www.google.com/generate_204"
-XPROBE_INT="30s"
+XPROBE_URL="https://www.gstatic.com/generate_204"
+XPROBE_INT="15s"
 XUI_DEF2='{"log":{"access":"none","dnsLog":false,"error":"","loglevel":"warning","maskAddress":""},"api":{"tag":"api","services":["HandlerService","LoggerService","StatsService"]},"inbounds":[{"tag":"api","listen":"127.0.0.1","port":62789,"protocol":"tunnel","settings":{"address":"127.0.0.1"}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"AsIs","redirect":"","noises":[]}},{"tag":"blocked","protocol":"blackhole","settings":{}}],"policy":{"levels":{"0":{"statsUserDownlink":true,"statsUserUplink":true}},"system":{"statsInboundDownlink":true,"statsInboundUplink":true,"statsOutboundDownlink":false,"statsOutboundUplink":false}},"routing":{"domainStrategy":"AsIs","rules":[{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","outboundTag":"blocked","ip":["geoip:private"]},{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]}]},"stats":{},"metrics":{"tag":"metrics_out","listen":"127.0.0.1:11111"}}'
 XUI_DEF3='{"api":{"services":["HandlerService","LoggerService","StatsService","RoutingService"],"tag":"api"},"inbounds":[{"listen":"127.0.0.1","port":62789,"protocol":"tunnel","settings":{"rewriteAddress":"127.0.0.1"},"tag":"api"}],"log":{"access":"none","dnsLog":false,"error":"","loglevel":"warning","maskAddress":""},"metrics":{"listen":"127.0.0.1:11111","tag":"metrics_out"},"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"block","ip":["geoip:private"]},{"action":"allow"}]},"tag":"direct"},{"protocol":"blackhole","settings":{},"tag":"blocked"}],"policy":{"levels":{"0":{"statsUserDownlink":true,"statsUserUplink":true}},"system":{"statsInboundDownlink":true,"statsInboundUplink":true,"statsOutboundDownlink":false,"statsOutboundUplink":false}},"routing":{"domainStrategy":"AsIs","rules":[{"inboundTag":["api"],"outboundTag":"api","type":"field"},{"ip":["geoip:private"],"outboundTag":"blocked","type":"field"},{"outboundTag":"blocked","protocol":["bittorrent"],"type":"field"}]},"stats":{}}'
 R443_MIN=10001
@@ -83,6 +83,8 @@ GSEC=()
 GPROTOS=()
 GKEY=n
 EXTRA_EXCL=""
+XB_MAIN=()
+XB_FB=""
 PORT_LIST=()
 TNAMES=()
 LNAMES=()
@@ -1677,6 +1679,8 @@ toml_tail() {
 toml_transport() {
     printf 'auth.method = "token"\nauth.token = "%s"\n' "${T[TOKEN]}"
     printf 'transport.tcpMux = %s\n' "$(tf "${T[TCPMUX]}")"
+    [ "${T[TCPMUX]}" = y ] && printf 'transport.tcpMuxKeepaliveInterval = 15\n'
+    return 0
 }
 
 allow_ports_toml() {
@@ -2439,17 +2443,16 @@ xray_groups_here() {
 
 xray_conf_gen() {
     local g u p sep=""
-    printf '{\n  "log": {"loglevel": "warning"},\n  "inbounds": [\n'
+    printf '{\n  "log": {"loglevel": "warning", "access": "none"},\n  "inbounds": [\n'
     while read -r g u p; do
         [ -n "$g" ] || continue
-        printf '%s    {"tag": "%s-in", "listen": "127.0.0.1", "port": %s, "protocol": "vless", "settings": {"clients": [{"id": "%s"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "none"}}' "$sep" "$g" "$p" "$u"
+        printf '%s    {"tag": "%s-in", "listen": "127.0.0.1", "port": %s, "protocol": "vless", "settings": {"clients": [{"id": "%s", "flow": ""}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "none"}}' "$sep" "$g" "$p" "$u"
         sep=$',\n'
     done < <(xray_groups_here)
     printf '\n  ],\n  "outbounds": [\n'
     printf '    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},\n'
     printf '    {"tag": "block", "protocol": "blackhole"}\n  ],\n'
-    printf '  "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"}]},\n'
-    printf '  "policy": {"levels": {"0": {"handshake": 8, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5}}}\n}\n'
+    printf '  "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"}]}\n}\n'
 }
 
 xray_unit_write() {
@@ -2550,7 +2553,7 @@ def patch(cfg, g, uuid, ports, url, iv):
     for k in ("observatory", "burstObservatory"):
         o = cfg.get(k)
         if isinstance(o, dict) and isinstance(o.get("subjectSelector"), list):
-            o["subjectSelector"] = [s for s in o["subjectSelector"] if s != pre]
+            o["subjectSelector"] = [s for s in o["subjectSelector"] if not str(s).startswith(pre)]
             if not o["subjectSelector"]:
                 cfg.pop(k, None)
     for name, port in ports:
@@ -2560,14 +2563,17 @@ def patch(cfg, g, uuid, ports, url, iv):
             "settings": {"vnext": [{"address": "127.0.0.1", "port": port, "users": [{"id": uuid, "encryption": "none", "flow": ""}]}]},
             "streamSettings": {"network": "tcp", "security": "none"}
         })
+    names = [n for n, _ in ports]
+    main = [n for n in names if n != "kcp"] or names
+    fb = "kcp" if "kcp" in names and main != names else (main[0] if main else "")
     if len(ports) > 1:
         k = "burstObservatory" if isinstance(cfg.get("burstObservatory"), dict) else "observatory"
         o = cfg.get(k)
         if not isinstance(o, dict):
             o = {"subjectSelector": [], "probeURL": url, "probeInterval": iv, "enableConcurrency": True}
-        o.setdefault("subjectSelector", []).append(pre)
+        o.setdefault("subjectSelector", []).extend(pre + n for n in main)
         cfg[k] = o
-        bals.append({"tag": g, "selector": [pre], "strategy": {"type": "leastPing"}, "fallbackTag": pre + ports[0][0]})
+        bals.append({"tag": g, "selector": [pre + n for n in main], "strategy": {"type": "leastPing"}, "fallbackTag": pre + fb})
     api = [i for i, r in enumerate(rules) if r.get("outboundTag") == "api" and "api" in (r.get("inboundTag") or [])]
     if api and api[0] != 0:
         rules.insert(0, rules.pop(api[0]))
@@ -2734,6 +2740,26 @@ is_group_name() { [[ $1 =~ ^[a-z][a-z0-9]{0,6}$ ]]; }
 is_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
 
 proto_sfx() { if [ "$1" = websocket ]; then printf 'ws'; else printf '%s' "$1"; fi; }
+
+xg_balance() {
+    local n s
+    XB_MAIN=()
+    XB_FB=""
+    local -a all=()
+    for n in $(xg_members "$1"); do
+        s=$(proto_sfx "$(meta_get "$n" PROTO)")
+        all+=("$s")
+        [ "$s" = kcp ] || XB_MAIN+=("$s")
+    done
+    if ((${#XB_MAIN[@]} == 0)); then
+        XB_MAIN=("${all[@]}")
+        XB_FB=${all[0]}
+    elif ((${#XB_MAIN[@]} < ${#all[@]})); then
+        XB_FB=kcp
+    else
+        XB_FB=${XB_MAIN[0]}
+    fi
+}
 
 xg_members() {
     local g=$1 n p
@@ -3591,6 +3617,7 @@ exit_create() {
     derive_side
     T[KIND]="exit"
     T[XMODE]=socks
+    T[POOL]=32
     T[PROTO]=tcp
     T[TLS]=y
     T[CERT_MODE]=builtin
@@ -4118,7 +4145,8 @@ xexit_guide() {
     done
     k=$((k + 1))
     if [ "$multi" = y ]; then
-        say "$k. Balancers > Add Balancer: Tag $g, Strategy Least Ping, Selector $g-, Fallback $g-$(proto_sfx "$(meta_get "$first" PROTO)")"
+        xg_balance "$g"
+        say "$k. Balancers > Add Balancer: Tag $g, Strategy Least Ping, Selectors ${XB_MAIN[*]/#/$g-}, Fallback $g-$XB_FB"
         k=$((k + 1))
         say "$k. Routing Rules > Add Rule: Network TCP,UDP, Balancer Tag $g. Keep this rule at the bottom"
     else
@@ -4189,9 +4217,9 @@ xexit_create() {
     GPROTOS=()
     blank
     ask g "Exit name" "$(next_group)" v_new_group "-"
-    choose c "Tunnel protocols" 1 "tcp + kcp + quic, use the best one automatically" "tcp only" "Choose myself"
+    choose c "Tunnel protocols" 1 "tcp + quic, use the faster one automatically, kcp as backup" "tcp only" "Choose myself"
     case $c in
-        1) GPROTOS=(tcp kcp quic) ;;
+        1) GPROTOS=(tcp quic kcp) ;;
         2) GPROTOS=(tcp) ;;
         3) ask list "Protocols, comma separated: tcp, kcp, quic, websocket" "tcp,kcp,quic" v_protos "-" ;;
     esac
@@ -4207,6 +4235,7 @@ xexit_create() {
     T[CERT_MODE]=builtin
     T[LISTEN]=local
     T[PTYPE]=tcp
+    T[POOL]=32
     section "Connection"
     get_public_ip && ip=$PUBIP
     ask "T[PUB_ADDR]" "Iran IP" "$ip" is_host "Enter a valid IP or domain"
@@ -4259,7 +4288,10 @@ xexit_create() {
         kv "${GPROTOS[i]}" "tunnel port ${tports[i]}, panel port 127.0.0.1:$((base + i))"
     done
     kv "Xray user ID" "$uuid"
-    ((${#GPROTOS[@]} > 1)) && kv "Switching" "the panel picks the fastest working tunnel every 30s"
+    if ((${#GPROTOS[@]} > 1)); then
+        kv "Switching" "every 15s the panel moves to the faster working tunnel"
+        [[ " ${GPROTOS[*]} " == *" kcp "* ]] && kv "kcp" "backup only, used when the others are down (it is slower)"
+    fi
     blank
     if ! confirm "Create this exit?" y; then
         warn "Cancelled"
@@ -4298,6 +4330,7 @@ xexit_create() {
         info "When Kharej is connected, add the exit to the panel with: Exit tunnel > Add an Xray exit to 3x-ui"
         xexit_guide "$g"
     fi
+    net_offer
     pause
 }
 
