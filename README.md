@@ -15,6 +15,7 @@ After the first run, the script installs itself as `frp-tunnel`.
 ## Features
 
 - Two modes: **Reverse** (Kharej connects to Iran, the default) and **Direct** (Iran connects to Kharej, through STCP or a plain proxy)
+- **Exit tunnel (users on Iran)**: users stay on the Iran panel and their traffic leaves from Kharej. The Kharej server runs only FRP with its SOCKS5 plugin, published on Iran at `127.0.0.1` with a random user and password. The script prints the 3x-ui outbound JSON and the DNS-over-HTTPS steps. Only TCP is carried, so UDP voice calls and games do not work through it
 - Transports: tcp, kcp, quic, websocket, wss (wss uses a socat TLS terminator in front of frps)
 - Fast setup: only Tunnel port, Iran/Kharej IP and VPN config ports are asked (TCP by default); protocol, TLS, token, UDP and the 127.0.0.1-only option for a panel on the same server are under Advanced settings
 - Firewall ports opened automatically (UFW, firewalld or iptables) and kept open after reboot

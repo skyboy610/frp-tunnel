@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-APP_VER="1.2.0"
+APP_VER="1.3.0"
 FRP_DEFAULT_VER="0.71.0"
 BASE_DIR="/etc/frp-tunnel"
 TUN_DIR="$BASE_DIR/tunnels"
@@ -24,6 +24,7 @@ LIMITS_FILE="/etc/security/limits.d/99-frp-tunnel.conf"
 SDLIMIT_FILE="/etc/systemd/system.conf.d/99-frp-tunnel.conf"
 RES_FILE="/etc/sysctl.d/99-frp-tunnel-ports.conf"
 RES_STATE="$BASE_DIR/reserved.ports"
+EXIT_TEST_URL="https://api.ipify.org"
 R443_MIN=10001
 R443_MAX=19999
 SYS_CA="/etc/ssl/certs/ca-certificates.crt"
@@ -1555,7 +1556,7 @@ fw_exec_pre() {
     return 0
 }
 
-META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE LISTEN TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP CREATED)
+META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE LISTEN TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP KIND SOCKS_USER SOCKS_PASS CREATED)
 
 tunnel_names() {
     local f
@@ -1730,8 +1731,20 @@ gen_client_head() {
     printf 'transport.dialServerTimeout = 10\n'
 }
 
+is_exit() { [ "${T[KIND]}" = exit ]; }
+
+gen_exit_proxy() {
+    printf '\n[[proxies]]\nname = "%s-socks"\ntype = "tcp"\nremotePort = %s\n' "${T[PFX]}" "${T[PORTS]}"
+    [ "${T[COMPRESS]}" = y ] && printf 'transport.useCompression = true\n'
+    printf '[proxies.plugin]\ntype = "socks5"\nusername = "%s"\npassword = "%s"\n' "${T[SOCKS_USER]}" "${T[SOCKS_PASS]}"
+}
+
 gen_proxies() {
     local kind=$1 p t typ
+    if is_exit; then
+        gen_exit_proxy
+        return
+    fi
     for t in tcp udp; do
         [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] || continue
         typ=$t
@@ -1879,6 +1892,11 @@ tunnel_defaults() {
     T[BIND_ADDR]=${T[BIND_ADDR]:-0.0.0.0}
     T[PTYPE]=${T[PTYPE]:-tcp}
     T[LISTEN]=${T[LISTEN]:-public}
+    T[KIND]=${T[KIND]:-forward}
+    if is_exit; then
+        T[LISTEN]=local
+        T[PTYPE]=tcp
+    fi
     T[MTLS]=${T[MTLS]:-n}
 }
 
@@ -1988,7 +2006,7 @@ key_lines() {
     a=("V=1" "NAME=${T[NAME]}" "PFX=${T[PFX]}" "ROLE=${T[ROLE]}" "MODE=${T[MODE]}" "METHOD=${T[METHOD]}" "PROTO=${T[PROTO]}"
         "ADDR=$addr" "PORT=$port" "TOKEN=${T[TOKEN]}" "TLS=${T[TLS]}" "CERT=${T[CERT_MODE]}" "REF=${T[CERT_REF]}"
         "MTLS=${T[MTLS]}" "TCPMUX=${T[TCPMUX]}" "COMPRESS=${T[COMPRESS]}" "POOL=${T[POOL]}" "HB_INT=${T[HB_INT]}"
-        "HB_TO=${T[HB_TO]}" "PORTS=${T[PORTS]}" "PTYPE=${T[PTYPE]}" "SK=${T[SK]}" "RESTRICT=${T[RESTRICT]}")
+        "HB_TO=${T[HB_TO]}" "PORTS=${T[PORTS]}" "PTYPE=${T[PTYPE]}" "SK=${T[SK]}" "RESTRICT=${T[RESTRICT]}" "KIND=${T[KIND]}" "SOCKS_USER=${T[SOCKS_USER]}" "SOCKS_PASS=${T[SOCKS_PASS]}")
     if [ "${T[CERT_MODE]}" = self ] && [ "${T[SIDE]}" = server ]; then
         [ -f "$CP_CA" ] && a+=("CA=$(base64 -w0 <"$CP_CA")")
         if [ "${T[MTLS]}" = y ] && [ -f "$CP_CCRT" ] && [ -f "$CP_CKEY" ]; then
@@ -2009,6 +2027,11 @@ key_valid() {
     [[ ${K[TCPMUX]} =~ ^[yn]$ && ${K[COMPRESS]} =~ ^[yn]$ && ${K[RESTRICT]} =~ ^[yn]$ ]] || return 1
     v_pool "${K[POOL]}" && v_hb "${K[HB_INT]}" && v_hb "${K[HB_TO]}" || return 1
     [[ ${K[PTYPE]} =~ ^(tcp|udp|both)$ ]] || return 1
+    [[ ${K[KIND]} =~ ^(|forward|exit)$ ]] || return 1
+    if [ "${K[KIND]}" = exit ]; then
+        [[ ${K[SOCKS_USER]} =~ ^[A-Za-z0-9]{4,64}$ && ${K[SOCKS_PASS]} =~ ^[A-Za-z0-9]{8,64}$ ]] || return 1
+        is_port "${K[PORTS]}" && [ "${K[MODE]}" = reverse ] || return 1
+    fi
     parse_ports "${K[PORTS]}" || return 1
     [ -z "${K[SK]}" ] || is_token "${K[SK]}" || return 1
     case ${K[CERT]} in
@@ -2075,7 +2098,7 @@ key_apply() {
     derive_side
     T[METHOD]=${K[METHOD]}
     local k
-    for k in PROTO TOKEN TLS MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE SK RESTRICT; do
+    for k in PROTO TOKEN TLS MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE SK RESTRICT KIND SOCKS_USER SOCKS_PASS; do
         T[$k]=${K[$k]}
     done
     T[PFX]=${K[PFX]:-${K[NAME]}}
@@ -2513,6 +2536,7 @@ step_port_type() {
 }
 
 step_service_ip() {
+    is_exit && return 0
     has_proxies_here || return 0
     ask "T[TARGET_IP]" "VPN service IP" "${T[TARGET_IP]:-127.0.0.1}" is_ip "Enter a valid IP"
 }
@@ -2529,7 +2553,7 @@ step_advanced() {
     if [ "${T[HB_INT]}" != 0 ] && [ "${T[HB_TO]}" != 0 ] && ((10#${T[HB_TO]} <= 10#${T[HB_INT]})); then
         warn "Heartbeat timeout should be larger than the interval"
     fi
-    if [ "${T[SIDE]}" = server ] && [ "${T[METHOD]}" != stcp ]; then
+    if [ "${T[SIDE]}" = server ] && [ "${T[METHOD]}" != stcp ] && ! is_exit; then
         if confirm "Allow only the listed VPN config ports on this server?" "${T[RESTRICT]}"; then T[RESTRICT]=y; else T[RESTRICT]=n; fi
     fi
     return 0
@@ -2615,6 +2639,12 @@ tunnel_summary() {
     [ -n "${T[LIP]}" ] && kv "Local IP link" "${T[LIP]}"
     kv "Tunnel token" "${T[TOKEN]}"
     kv "TLS" "$(tls_label)"
+    if is_exit; then
+        kv "Tunnel type" "Exit for the Iran panel, traffic leaves from Kharej"
+        [ "${T[SIDE]}" = server ] && kv "Panel SOCKS" "127.0.0.1:${T[PORTS]}  ${T[SOCKS_USER]} / ${T[SOCKS_PASS]}"
+        kv "Advanced" "$(adv_label)"
+        return
+    fi
     kv "VPN config ports" "${T[PORTS]} ${T[PTYPE]}"
     if bind_here; then
         if [ "${T[LISTEN]}" = local ]; then kv "VPN ports access" "127.0.0.1 only"; else kv "VPN ports access" "open to the internet"; fi
@@ -2687,12 +2717,14 @@ tunnel_create() {
         return
     fi
     tunnel_defaults
-    section "VPN configs"
-    if [ "$adv" = y ]; then
-        step_port_type
-        step_listen
+    if ! is_exit; then
+        section "VPN configs"
+        if [ "$adv" = y ]; then
+            step_port_type
+            step_listen
+        fi
+        step_ports
     fi
-    step_ports
     tunnel_summary
     blank
     if ! confirm "Create this tunnel?" y; then
@@ -2711,7 +2743,104 @@ tunnel_create() {
         else
             info "Done. No need to paste anything on the $(other_role) server."
         fi
+        is_exit && info "This server is now the exit for the Iran panel. Nothing else is needed here."
         net_offer
+    else
+        err "Tunnel files were saved but the service was not started. Use Edit to fix it."
+    fi
+    pause
+}
+
+v_socks_port() {
+    is_port "$1" || {
+        err "Port must be between 1 and 65535"
+        return 1
+    }
+    v_ports_bind "$1"
+}
+
+next_exit_name() {
+    local i=1
+    while [ -e "$TUN_DIR/exit$i" ]; do i=$((i + 1)); done
+    printf 'exit%s' "$i"
+}
+
+guide_json() {
+    cnext
+    printf '     \e[38;5;%sm%s\e[0m\n' "$NC" "$1"
+}
+
+exit_panel_guide() {
+    section "Iran panel setup (3x-ui > Xray Configs)"
+    say "1. Outbounds > Add Outbound > JSON tab, paste this, then click First on it:"
+    guide_json "{\"tag\": \"kharej\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": ${T[PORTS]}, \"users\": [{\"user\": \"${T[SOCKS_USER]}\", \"pass\": \"${T[SOCKS_PASS]}\"}]}]}}"
+    say "2. Outbounds > Add Outbound > JSON tab, paste this:"
+    guide_json '{"tag": "dns-out", "protocol": "dns"}'
+    say "3. Routing Rules > Add Rule: Network UDP, Port 53, Outbound dns-out"
+    say "4. DNS > Enable DNS > Add Server: https://1.1.1.1/dns-query"
+    say "5. Save, then Restart Xray"
+    blank
+    kv "SOCKS address" "127.0.0.1:${T[PORTS]}"
+    kv "SOCKS user" "${T[SOCKS_USER]}"
+    kv "SOCKS password" "${T[SOCKS_PASS]}"
+    warn "Only TCP goes through this exit, so steps 2-4 send DNS over TCP. Voice calls and games that need UDP will not work."
+}
+
+exit_create() {
+    local d
+    need_frp || return
+    header "EXIT TUNNEL (USERS ON IRAN)"
+    info "Run this on the Iran server. Users stay on the Iran panel and their traffic leaves from Kharej."
+    info "The Kharej server only needs this script. No Xray or panel is needed there."
+    T=()
+    K=()
+    EXCL=()
+    T[ROLE]=iran
+    T[MODE]=reverse
+    derive_side
+    T[KIND]="exit"
+    T[PROTO]=tcp
+    T[TLS]=y
+    T[CERT_MODE]=builtin
+    T[LISTEN]=local
+    T[PTYPE]=tcp
+    blank
+    ask "T[NAME]" "Tunnel name" "$(next_exit_name)" v_new_name "-"
+    if confirm "Advanced settings?" n; then
+        section "Advanced"
+        step_proto
+        section "Connection"
+        step_endpoint
+        step_token
+        section "Advanced"
+        if ! step_advanced; then
+            err "TLS setup failed, tunnel was not created"
+            pause
+            return
+        fi
+    else
+        section "Connection"
+        step_endpoint
+        T[TOKEN]=$(rand_str 32)
+    fi
+    tunnel_defaults
+    section "Panel SOCKS"
+    d=$(alloc_port 20800)
+    ask "T[PORTS]" "Panel SOCKS port" "$d" v_socks_port "-"
+    T[SOCKS_USER]="u$(rand_str 7)"
+    T[SOCKS_PASS]=$(rand_str 20)
+    tunnel_summary
+    blank
+    if ! confirm "Create this tunnel?" y; then
+        warn "Cancelled"
+        pause
+        return
+    fi
+    blank
+    if tunnel_apply; then
+        ok "Exit tunnel '${T[NAME]}' created"
+        key_show
+        exit_panel_guide
     else
         err "Tunnel files were saved but the service was not started. Use Edit to fix it."
     fi
@@ -2734,7 +2863,7 @@ tunnel_table() {
         en=$(svc_enabled "frp-$n.service")
         cnext
         printf '  \e[38;5;%sm%-3s %-12s %-8s %-8s %-9s %-14s\e[0m \e[38;5;%sm%-9s\e[0m\e[38;5;%sm%s\e[0m\n' \
-            "$NC" "$((i + 1))" "$n" "$(side_role "${T[ROLE]}")" "${T[MODE]}" "${T[PROTO]}" "$(trunc "${T[PORTS]}" 14)" \
+            "$NC" "$((i + 1))" "$n" "$(side_role "${T[ROLE]}")" "$(is_exit && echo exit || echo "${T[MODE]}")" "${T[PROTO]}" "$(trunc "${T[PORTS]}" 14)" \
             "$(state_color "$st")" "$st" "$(state_color "$en")" "$en"
     done
     return 0
@@ -2780,6 +2909,7 @@ tunnel_details() {
         printf '  \e[38;5;%sm%-20s\e[0m \e[38;5;%sm%s\e[0m \e[38;5;%sm/ %s\e[0m\n' "$NC" "$u" "$(state_color "$st")" "$st" "$NC" "$(svc_enabled "$u")"
     done
     kv "Admin API" "http://127.0.0.1:${T[ADMIN_PORT]}  ${T[ADMIN_USER]} / ${T[ADMIN_PASS]}"
+    is_exit && [ "${T[SIDE]}" = server ] && exit_panel_guide
     kv "Created" "${T[CREATED]}"
     cert_paths
     if [ "${T[CERT_MODE]}" = self ] || [ "${T[CERT_MODE]}" = le ]; then
@@ -2822,7 +2952,11 @@ tunnel_edit() {
     while :; do
         header "EDIT: $n"
         item 1 "Tunnel port & IP     $(endpoint_label)"
-        item 2 "VPN config ports     ${T[PORTS]} ${T[PTYPE]}"
+        if is_exit; then
+            item 2 "Panel SOCKS port     ${T[PORTS]}"
+        else
+            item 2 "VPN config ports     ${T[PORTS]} ${T[PTYPE]}"
+        fi
         item 3 "Advanced settings    ${T[PROTO]}, TLS $(tls_label)"
         item 4 "Save and apply"
         item 0 "Cancel"
@@ -2831,9 +2965,17 @@ tunnel_edit() {
         case $c in
             1) step_endpoint ;;
             2)
-                step_port_type
-                step_listen
-                step_ports
+                if is_exit; then
+                    if [ "${T[SIDE]}" = server ]; then
+                        ask "T[PORTS]" "Panel SOCKS port" "${T[PORTS]}" v_socks_port "-"
+                    else
+                        ask "T[PORTS]" "Panel SOCKS port" "${T[PORTS]}" is_port "Port must be between 1 and 65535"
+                    fi
+                else
+                    step_port_type
+                    step_listen
+                    step_ports
+                fi
                 ;;
             3)
                 old=${T[PROTO]}
@@ -2855,6 +2997,7 @@ tunnel_edit() {
                     ok "Tunnel '$n' updated"
                     warn "Make the same change on the $(other_role) server with Edit, or delete the tunnel there and create it again with this key"
                     key_show
+                    is_exit && [ "${T[SIDE]}" = server ] && exit_panel_guide
                 fi
                 pause
                 return
@@ -3002,6 +3145,8 @@ tunnel_diagnose() {
         if has_proxies_here; then
             if ((total == 0)); then
                 warn "Not logged in to the $other server yet"
+            elif is_exit && ((run == total)); then
+                ok "The exit is connected to the $other server"
             elif ((run == total)); then
                 ok "All $total VPN config port forwards are active"
             else
@@ -3034,12 +3179,28 @@ tunnel_diagnose() {
                     [ -n "${LMAP[$p]}" ] || miss+="$p/$t "
                 done
             done
-            if [ -n "$miss" ]; then
+            if is_exit && [ -n "$miss" ]; then
+                err "Panel SOCKS port ${T[PORTS]} is not open yet"
+                diag_fix "Run Diagnose on the Kharej server, it shows the reason from its side"
+            elif is_exit; then
+                ok "Panel SOCKS port ${T[PORTS]} is open on 127.0.0.1"
+            elif [ -n "$miss" ]; then
                 err "VPN config ports not open yet: $(short_list "$miss")"
                 diag_fix "Make sure the same VPN config ports are set on both servers"
             else
                 ok "All VPN config ports are open on this server"
             fi
+        fi
+    fi
+    if is_exit && [ "${T[SIDE]}" = server ] && [ "${cc:-0}" -gt 0 ]; then
+        p=$(curl -s -m 12 --socks5-hostname "${T[SOCKS_USER]}:${T[SOCKS_PASS]}@127.0.0.1:${T[PORTS]}" "$EXIT_TEST_URL" 2>/dev/null | head -c 60)
+        if is_ip "$p"; then
+            ok "The exit works, traffic leaves from Kharej IP $p"
+        elif [ -n "$p" ]; then
+            ok "The exit works, traffic leaves from Kharej"
+        else
+            err "The exit does not pass traffic yet"
+            diag_fix "Run Diagnose on the Kharej server, and check that the Kharej server has internet access"
         fi
     fi
     if grep -q 'connect to local service' <<<"$log"; then
@@ -3858,33 +4019,35 @@ main_menu() {
     blank
     item 1 "Install / Update FRP"
     item 2 "Create tunnel"
-    item 3 "Tunnels"
-    item 4 "Edit tunnel"
-    item 5 "Delete tunnel"
-    item 6 "Service control"
-    item 7 "Logs & diagnose"
-    item 8 "Local IP"
-    item 9 "Certificates"
-    item 10 "Network optimize"
-    item 11 "Watchdog"
-    item 12 "Backup & restore"
-    item 13 "Uninstall"
+    item 3 "Exit tunnel (users on Iran)"
+    item 4 "Tunnels"
+    item 5 "Edit tunnel"
+    item 6 "Delete tunnel"
+    item 7 "Service control"
+    item 8 "Logs & diagnose"
+    item 9 "Local IP"
+    item 10 "Certificates"
+    item 11 "Network optimize"
+    item 12 "Watchdog"
+    item 13 "Backup & restore"
+    item 14 "Uninstall"
     item 0 "Exit"
-    menu_pick c 13
+    menu_pick c 14
     case $c in
         1) frp_menu ;;
         2) tunnel_create ;;
-        3) tunnels_menu ;;
-        4) tunnel_edit ;;
-        5) tunnel_delete ;;
-        6) svc_menu ;;
-        7) logs_menu ;;
-        8) lip_menu ;;
-        9) cert_menu ;;
-        10) net_menu ;;
-        11) wd_menu ;;
-        12) backup_menu ;;
-        13) uninstall_all ;;
+        3) exit_create ;;
+        4) tunnels_menu ;;
+        5) tunnel_edit ;;
+        6) tunnel_delete ;;
+        7) svc_menu ;;
+        8) logs_menu ;;
+        9) lip_menu ;;
+        10) cert_menu ;;
+        11) net_menu ;;
+        12) wd_menu ;;
+        13) backup_menu ;;
+        14) uninstall_all ;;
         0)
             printf '\e[0m\n'
             exit 0
