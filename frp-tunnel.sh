@@ -29,8 +29,6 @@ R443_MAX=19999
 SYS_CA="/etc/ssl/certs/ca-certificates.crt"
 TLS_SNI="frp-tunnel.internal"
 KEY_PREFIX="frpt1:"
-GKEY_PREFIX="frpg1:"
-GROUP_DIR="$BASE_DIR/groups"
 MAX_PORTS=1000
 FRP_REPO="https://github.com/fatedier/frp"
 ACME_TGZ="https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz"
@@ -65,9 +63,8 @@ declare -A K=()
 declare -A L=()
 declare -A LMAP=()
 declare -A EXCL=()
+declare -A OTHERS=()
 PORT_LIST=()
-BIND_LIST=()
-EXTRA_EXCL=""
 TNAMES=()
 LNAMES=()
 
@@ -374,7 +371,7 @@ ensure_deps() {
 }
 
 init_dirs() {
-    mkdir -p "$TUN_DIR" "$CERT_DIR/self" "$CERT_DIR/le" "$LIP_DIR" "$HOOK_DIR" "$LOG_DIR" "$GROUP_DIR"
+    mkdir -p "$TUN_DIR" "$CERT_DIR/self" "$CERT_DIR/le" "$LIP_DIR" "$HOOK_DIR" "$LOG_DIR"
     chmod 700 "$BASE_DIR" "$TUN_DIR" "$CERT_DIR"
 }
 
@@ -1408,8 +1405,8 @@ fw_specs_tunnel() {
         rules+=("tcp|${T[BIND_PORT]}|")
         [[ ${T[PROTO]} == kcp || ${T[PROTO]} == quic ]] && rules+=("udp|${T[BIND_PORT]}|")
     fi
-    if bind_here && [ "${T[LISTEN]}" != local ] && parse_ports "${T[PORTS]}" && bind_port_list; then
-        IFS=, read -ra toks <<<"$(ports_compact "${BIND_LIST[@]}")"
+    if bind_here && [ "${T[LISTEN]}" != local ]; then
+        IFS=, read -ra toks <<<"${T[PORTS]}"
         for tok in "${toks[@]}"; do
             for t in tcp udp; do
                 [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] && rules+=("$t|${tok/-/:}|")
@@ -1511,8 +1508,8 @@ res_collect() {
         load_meta "$f" || continue
         [ "${T[SIDE]}" = server ] && printf '%s\n' "${T[BIND_PORT]}" "${T[INT_PORT]}"
         printf '%s\n' "${T[ADMIN_PORT]}" "${T[PADMIN_PORT]}"
-        if bind_here && parse_ports "${T[PORTS]}" && bind_port_list; then
-            printf '%s\n' "${BIND_LIST[@]}"
+        if bind_here && parse_ports "${T[PORTS]}"; then
+            printf '%s\n' "${PORT_LIST[@]}"
         fi
     done | grep -E '^[0-9]+$' | sort -un
 }
@@ -1558,7 +1555,7 @@ fw_exec_pre() {
     return 0
 }
 
-META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE ROFF LISTEN TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP GROUP CREATED)
+META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE LISTEN TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP CREATED)
 
 tunnel_names() {
     local f
@@ -1622,28 +1619,6 @@ has_proxies_here() {
     return 1
 }
 
-roff() {
-    local r=${T[ROFF]:-0} s=1
-    [[ $r =~ ^-?[0-9]{1,5}$ ]] || r=0
-    if [[ $r == -* ]]; then
-        s=-1
-        r=${r#-}
-    fi
-    printf '%s' "$((s * 10#$r))"
-}
-
-bind_port_list() {
-    local r p q
-    r=$(roff)
-    BIND_LIST=()
-    for p in "${PORT_LIST[@]}"; do
-        q=$((p + r))
-        ((q >= 1 && q <= 65535)) || return 1
-        BIND_LIST+=("$q")
-    done
-    return 0
-}
-
 hb_val() { if [ "${1:-0}" = 0 ]; then printf '%s' "-1"; else printf '%s' "$1"; fi; }
 
 cert_paths() {
@@ -1684,8 +1659,7 @@ toml_transport() {
 allow_ports_toml() {
     local out="" tok
     local -a toks
-    bind_port_list
-    IFS=, read -ra toks <<<"$(ports_compact "${BIND_LIST[@]}")"
+    IFS=, read -ra toks <<<"$(ports_compact)"
     for tok in "${toks[@]}"; do
         if [[ $tok == *-* ]]; then
             out+="${out:+, }{ start = ${tok%-*}, end = ${tok#*-} }"
@@ -1757,8 +1731,7 @@ gen_client_head() {
 }
 
 gen_proxies() {
-    local kind=$1 p t typ r
-    r=$(roff)
+    local kind=$1 p t typ
     for t in tcp udp; do
         [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] || continue
         typ=$t
@@ -1770,7 +1743,7 @@ gen_proxies() {
             if [ "$kind" = stcp ]; then
                 printf 'secretKey = "%s"\n' "${T[SK]}"
             else
-                printf 'remotePort = %s\n' "$((p + r))"
+                printf 'remotePort = %s\n' "$p"
             fi
             [ "${T[COMPRESS]}" = y ] && printf 'transport.useCompression = true\n'
         done
@@ -1778,14 +1751,13 @@ gen_proxies() {
 }
 
 gen_visitors() {
-    local p t typ ba=0.0.0.0 r
-    r=$(roff)
+    local p t typ ba=0.0.0.0
     [ "${T[LISTEN]}" = local ] && ba=127.0.0.1
     for t in tcp udp; do
         [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] || continue
         if [ "$t" = tcp ]; then typ=stcp; else typ=sudp; fi
         for p in "${PORT_LIST[@]}"; do
-            printf '\n[[visitors]]\nname = "%s-v%s-%s"\ntype = "%s"\nserverName = "%s-%s-%s"\nsecretKey = "%s"\nbindAddr = "%s"\nbindPort = %s\n' "${T[PFX]}" "$typ" "$p" "$typ" "${T[PFX]}" "$typ" "$p" "${T[SK]}" "$ba" "$((p + r))"
+            printf '\n[[visitors]]\nname = "%s-v%s-%s"\ntype = "%s"\nserverName = "%s-%s-%s"\nsecretKey = "%s"\nbindAddr = "%s"\nbindPort = %s\n' "${T[PFX]}" "$typ" "$p" "$typ" "${T[PFX]}" "$typ" "$p" "${T[SK]}" "$ba" "$p"
             [ "${T[COMPRESS]}" = y ] && printf 'transport.useCompression = true\n'
         done
     done
@@ -1907,7 +1879,6 @@ tunnel_defaults() {
     T[BIND_ADDR]=${T[BIND_ADDR]:-0.0.0.0}
     T[PTYPE]=${T[PTYPE]:-tcp}
     T[LISTEN]=${T[LISTEN]:-public}
-    T[ROFF]=$(roff)
     T[MTLS]=${T[MTLS]:-n}
 }
 
@@ -1916,8 +1887,7 @@ tunnel_finalize() {
     tunnel_defaults
     T[PFX]=${T[PFX]:-${T[NAME]}}
     parse_ports "${T[PORTS]}" || PORT_LIST=()
-    bind_port_list
-    ex=" ${PORT_LIST[*]} ${BIND_LIST[*]} ${T[BIND_PORT]} $EXTRA_EXCL "
+    ex=" ${PORT_LIST[*]} ${T[BIND_PORT]} "
     if [ "${T[METHOD]}" = stcp ]; then
         [ -n "${T[SK]}" ] || T[SK]=$(rand_str 24)
     else
@@ -2018,7 +1988,7 @@ key_lines() {
     a=("V=1" "NAME=${T[NAME]}" "PFX=${T[PFX]}" "ROLE=${T[ROLE]}" "MODE=${T[MODE]}" "METHOD=${T[METHOD]}" "PROTO=${T[PROTO]}"
         "ADDR=$addr" "PORT=$port" "TOKEN=${T[TOKEN]}" "TLS=${T[TLS]}" "CERT=${T[CERT_MODE]}" "REF=${T[CERT_REF]}"
         "MTLS=${T[MTLS]}" "TCPMUX=${T[TCPMUX]}" "COMPRESS=${T[COMPRESS]}" "POOL=${T[POOL]}" "HB_INT=${T[HB_INT]}"
-        "HB_TO=${T[HB_TO]}" "PORTS=${T[PORTS]}" "PTYPE=${T[PTYPE]}" "SK=${T[SK]}" "RESTRICT=${T[RESTRICT]}" "ROFF=$(roff)")
+        "HB_TO=${T[HB_TO]}" "PORTS=${T[PORTS]}" "PTYPE=${T[PTYPE]}" "SK=${T[SK]}" "RESTRICT=${T[RESTRICT]}")
     if [ "${T[CERT_MODE]}" = self ] && [ "${T[SIDE]}" = server ]; then
         [ -f "$CP_CA" ] && a+=("CA=$(base64 -w0 <"$CP_CA")")
         if [ "${T[MTLS]}" = y ] && [ -f "$CP_CCRT" ] && [ -f "$CP_CKEY" ]; then
@@ -2039,7 +2009,6 @@ key_valid() {
     [[ ${K[TCPMUX]} =~ ^[yn]$ && ${K[COMPRESS]} =~ ^[yn]$ && ${K[RESTRICT]} =~ ^[yn]$ ]] || return 1
     v_pool "${K[POOL]}" && v_hb "${K[HB_INT]}" && v_hb "${K[HB_TO]}" || return 1
     [[ ${K[PTYPE]} =~ ^(tcp|udp|both)$ ]] || return 1
-    [ -z "${K[ROFF]}" ] || [[ ${K[ROFF]} =~ ^-?[0-9]{1,5}$ ]] || return 1
     parse_ports "${K[PORTS]}" || return 1
     [ -z "${K[SK]}" ] || is_token "${K[SK]}" || return 1
     case ${K[CERT]} in
@@ -2071,7 +2040,6 @@ key_decode() {
 key_parse() {
     local data
     K=()
-    [[ $1 == "$GKEY_PREFIX"* ]] && return 2
     [[ $1 == "$KEY_PREFIX"* ]] || return 1
     data=$(key_decode "$1" "$KEY_PREFIX") || return 1
     key_load "$data"
@@ -2090,18 +2058,10 @@ key_prompt() {
         fi
         k=${k//[[:space:]]/}
         [ -z "$k" ] && return 1
-        key_parse "$k"
-        case $? in
-            0) ;;
-            2)
-                err "This is a multi-protocol key. Use Multi-protocol tunnel in the main menu."
-                continue
-                ;;
-            *)
-                err "Invalid connection key"
-                continue
-                ;;
-        esac
+        if ! key_parse "$k"; then
+            err "Invalid connection key"
+            continue
+        fi
         if [ -n "${T[ROLE]}" ] && [ "${K[ROLE]}" = "${T[ROLE]}" ]; then
             warn "This key comes from the $(side_role "${K[ROLE]}") server, so this server is set to $(other_role)"
         fi
@@ -2115,7 +2075,7 @@ key_apply() {
     derive_side
     T[METHOD]=${K[METHOD]}
     local k
-    for k in PROTO TOKEN TLS MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE SK RESTRICT ROFF; do
+    for k in PROTO TOKEN TLS MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE SK RESTRICT; do
         T[$k]=${K[$k]}
     done
     T[PFX]=${K[PFX]:-${K[NAME]}}
@@ -2199,13 +2159,45 @@ v_new_name() {
     return 0
 }
 
+others_ports() {
+    local f t p
+    for f in "$TUN_DIR"/*/tunnel.conf; do
+        [ -f "$f" ] || continue
+        load_meta "$f" || continue
+        [ "${T[NAME]}" = "$1" ] && continue
+        if [ "${T[SIDE]}" = server ]; then
+            printf '%s/tcp %s\n' "${T[BIND_PORT]}" "${T[NAME]}"
+            [[ ${T[PROTO]} == kcp || ${T[PROTO]} == quic ]] && printf '%s/udp %s\n' "${T[BIND_PORT]}" "${T[NAME]}"
+        fi
+        if bind_here && parse_ports "${T[PORTS]}"; then
+            for t in tcp udp; do
+                [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] || continue
+                for p in "${PORT_LIST[@]}"; do printf '%s/%s %s\n' "$p" "$t" "${T[NAME]}"; done
+            done
+        fi
+    done
+}
+
+load_others() {
+    local k n
+    OTHERS=()
+    while read -r k n; do
+        [ -n "$k" ] && OTHERS[$k]=$n
+    done < <(others_ports "${T[NAME]}")
+}
+
 v_bind_port() {
     local t o
     is_port "$1" || {
         err "Port must be between 1 and 65535"
         return 1
     }
+    load_others
     for t in $CHK_PROTOS; do
+        if [ -n "${OTHERS[$1/$t]}" ]; then
+            err "Port $1/$t belongs to tunnel ${OTHERS[$1/$t]}"
+            return 1
+        fi
         [ -n "${EXCL[$1/$t]}" ] && continue
         if o=$(port_owner "$1" "$t"); then
             err "Port $1/$t is already in use by $o"
@@ -2229,26 +2221,28 @@ own_ports_hit() {
 }
 
 v_ports_bind() {
-    local b x
-    local -a orig
+    local b x p t
     parse_ports "$1" || {
         err "Use ports like 443,8080,2000-2010 (max $MAX_PORTS)"
         return 1
     }
-    if ! bind_port_list; then
-        err "With this tunnel's port mapping these ports go past 65535"
-        return 1
-    fi
-    orig=("${PORT_LIST[@]}")
-    PORT_LIST=("${BIND_LIST[@]}")
     if [ "${T[SIDE]}" = server ] && x=$(own_ports_hit); then
-        PORT_LIST=("${orig[@]}")
         err "Port $x is used by the tunnel itself"
         return 1
     fi
+    load_others
+    for t in tcp udp; do
+        [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] || continue
+        for p in "${PORT_LIST[@]}"; do
+            if [ -n "${OTHERS[$p/$t]}" ]; then
+                err "Port $p/$t belongs to tunnel ${OTHERS[$p/$t]}"
+                return 1
+            fi
+        done
+    done
+    parse_ports "$1"
     b=$(busy_ports "${T[PTYPE]}")
-    PORT_LIST=("${orig[@]}")
-    if r443_present && r443_hit "${BIND_LIST[@]}"; then
+    if r443_present && r443_hit "${PORT_LIST[@]}"; then
         warn "reality443 gives ports $R443_MIN-$R443_MAX to its inbounds. A port outside this range is safer."
     fi
     if [ -n "$b" ]; then
@@ -2622,10 +2616,6 @@ tunnel_summary() {
     kv "Tunnel token" "${T[TOKEN]}"
     kv "TLS" "$(tls_label)"
     kv "VPN config ports" "${T[PORTS]} ${T[PTYPE]}"
-    if [ "$(roff)" != 0 ] && parse_ports "${T[PORTS]}" && bind_port_list; then
-        kv "$([ "${T[MODE]}" = reverse ] || [ "${T[METHOD]}" = stcp ] && echo Iran || echo Kharej) ports" "$(ports_compact "${BIND_LIST[@]}")"
-    fi
-    [ -n "${T[GROUP]}" ] && kv "Multi-protocol group" "${T[GROUP]}"
     if bind_here; then
         if [ "${T[LISTEN]}" = local ]; then kv "VPN ports access" "127.0.0.1 only"; else kv "VPN ports access" "open to the internet"; fi
     fi
@@ -2790,23 +2780,13 @@ tunnel_details() {
         printf '  \e[38;5;%sm%-20s\e[0m \e[38;5;%sm%s\e[0m \e[38;5;%sm/ %s\e[0m\n' "$NC" "$u" "$(state_color "$st")" "$st" "$NC" "$(svc_enabled "$u")"
     done
     kv "Admin API" "http://127.0.0.1:${T[ADMIN_PORT]}  ${T[ADMIN_USER]} / ${T[ADMIN_PASS]}"
-    if [ -n "${T[GROUP]}" ] && [ -d "$GROUP_DIR/${T[GROUP]}" ]; then
-        local gf
-        for gf in "$GROUP_DIR/${T[GROUP]}"/*.json; do
-            [ -f "$gf" ] && kv "Xray config" "$gf"
-        done
-    fi
     kv "Created" "${T[CREATED]}"
     cert_paths
     if [ "${T[CERT_MODE]}" = self ] || [ "${T[CERT_MODE]}" = le ]; then
         local f
         f=$(cert_main_file "$CERT_DIR/${T[CERT_MODE]}/${T[CERT_REF]}") && cert_expiry "$f" && kv "Certificate expires" "$CE_DATE, $CE_DAYS days"
     fi
-    if [ -n "${T[GROUP]}" ] && [ "${T[ROLE]}" = iran ] && [ -f "$GROUP_DIR/${T[GROUP]}.conf" ]; then
-        group_key_show "${T[GROUP]}"
-    else
-        key_show
-    fi
+    key_show
     pause
 }
 
@@ -2828,8 +2808,8 @@ tunnel_edit() {
     tunnel_defaults
     EXCL=()
     K=()
-    if parse_ports "${T[PORTS]}" && bind_port_list; then
-        for c in "${BIND_LIST[@]}"; do
+    if parse_ports "${T[PORTS]}"; then
+        for c in "${PORT_LIST[@]}"; do
             [ "${T[PTYPE]}" != udp ] && EXCL[$c/tcp]=1
             [ "${T[PTYPE]}" != tcp ] && EXCL[$c/udp]=1
         done
@@ -2842,7 +2822,7 @@ tunnel_edit() {
     while :; do
         header "EDIT: $n"
         item 1 "Tunnel port & IP     $(endpoint_label)"
-        item 2 "VPN config ports     ${T[PORTS]} ${T[PTYPE]}$([ "$(roff)" != 0 ] && printf ', mapped %+d' "$(roff)")"
+        item 2 "VPN config ports     ${T[PORTS]} ${T[PTYPE]}"
         item 3 "Advanced settings    ${T[PROTO]}, TLS $(tls_label)"
         item 4 "Save and apply"
         item 0 "Cancel"
@@ -2885,22 +2865,12 @@ tunnel_edit() {
 }
 
 tunnel_delete() {
-    local n m r g x
+    local n m r
     header "DELETE TUNNEL"
     pick_tunnel n || return
     tunnel_load "$n"
     m=${T[CERT_MODE]}
     r=${T[CERT_REF]}
-    g=${T[GROUP]}
-    if [ -n "$g" ] && [ -f "$GROUP_DIR/$g.conf" ] && confirm "Delete all tunnels of multi-protocol group '$g'?" y; then
-        for x in $(group_members "$g"); do
-            tunnel_remove "$x"
-            ok "Tunnel '$x' deleted"
-        done
-        rm -rf "${GROUP_DIR:?}/$g.conf" "${GROUP_DIR:?}/$g"
-        pause
-        return
-    fi
     if confirm "Delete tunnel '$n'?" n; then
         tunnel_remove "$n"
         ok "Tunnel '$n' deleted"
@@ -2948,463 +2918,181 @@ live_log() {
     trap on_int INT
 }
 
+diag_fix() { cnext; printf '  \e[38;5;%sm  Fix: %s\e[0m\n' "$NC" "$*"; }
+
+diag_log_line() {
+    grep -nE "doesn't match token|i/o timeout|no route to host|network is unreachable|connection refused|port already used|port unavailable|port not allowed|is already in use|x509|tls: |handshake|login to server success|start proxy success|EOF" <<<"$1" | tail -n 1 | cut -d: -f2-
+}
+
+diag_explain() {
+    local line=$1 other=$2 port=$3
+    case $line in
+        *"doesn't match token"*)
+            err "The tunnel token is different on the two servers"
+            diag_fix "Delete this tunnel and create it again with the connection key"
+            ;;
+        *"i/o timeout"* | *"no route to host"* | *"network is unreachable"*)
+            err "The $other server does not answer on the tunnel port $port"
+            diag_fix "Check the $other IP, and open port $port in the $other server firewall and provider panel"
+            diag_fix "Some datacenters block rare ports. Try a common tunnel port such as 8443, 2053 or 2087"
+            ;;
+        *"connection refused"*)
+            err "The $other server refused the connection on port $port"
+            diag_fix "The tunnel is not running there, or its tunnel port is not $port. Check it on the $other server"
+            ;;
+        *"port already used"* | *"port unavailable"*)
+            err "A VPN config port is already used by another program on the Iran server"
+            diag_fix "Free that port (for example nginx uses 443) or use another port on both servers"
+            ;;
+        *"port not allowed"*)
+            err "The VPN config ports are not the same on the two servers"
+            diag_fix "Use the same VPN config ports on both servers, or create the tunnel again with the key"
+            ;;
+        *"is already in use"*)
+            err "Another tunnel with the same name is already connected"
+            diag_fix "Delete the old copy of this tunnel on the other Kharej server"
+            ;;
+        *x509* | *"tls: "* | *handshake* | *EOF*)
+            err "The connection breaks during setup. TLS or protocol settings may differ"
+            diag_fix "Create the tunnel again on this server with the connection key"
+            ;;
+        *"login to server success"* | *"start proxy success"*)
+            ok "Connected to the $other server"
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+diag_reach() {
+    timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1
+}
+
+tunnel_diagnose() {
+    local n=$1 st log line other port out total run p t miss="" cc
+    tunnel_load "$n" || return
+    header "DIAGNOSE: $n"
+    other=$(other_role)
+    st=$(svc_state "frp-$n.service")
+    if [ "$st" = active ]; then
+        ok "Service frp-$n is running"
+    else
+        err "Service frp-$n is $st"
+        diag_fix "Use Service control to start it, the log below shows why it stopped"
+        journalctl -u "frp-$n.service" -n 8 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+        return
+    fi
+    log=$(journalctl -u "frp-$n.service" -n 150 --no-pager -o cat 2>/dev/null)
+    if [ "${T[SIDE]}" = client ]; then
+        port=${T[SERVER_PORT]}
+        case ${T[PROTO]} in
+            kcp | quic) info "${T[PROTO]} uses UDP, so the tunnel port cannot be tested directly" ;;
+            *)
+                if diag_reach "${T[SERVER_ADDR]}" "$port"; then
+                    ok "$other IP ${T[SERVER_ADDR]} answers on tunnel port $port"
+                else
+                    err "$other IP ${T[SERVER_ADDR]} does not answer on tunnel port $port"
+                    diag_fix "Check that the tunnel runs on the $other server and that port $port is open in its firewall and provider panel"
+                fi
+                ;;
+        esac
+        out=$(curl -s -m 5 -u "${T[ADMIN_USER]}:${T[ADMIN_PASS]}" "http://127.0.0.1:${T[ADMIN_PORT]}/api/status" 2>/dev/null)
+        total=$(grep -o '"status":"[^"]*"' <<<"$out" | wc -l)
+        run=$(grep -o '"status":"running"' <<<"$out" | wc -l)
+        if has_proxies_here; then
+            if ((total == 0)); then
+                warn "Not logged in to the $other server yet"
+            elif ((run == total)); then
+                ok "All $total VPN config port forwards are active"
+            else
+                err "$run of $total VPN config port forwards are active"
+                grep -oE '"name":"[^"]*","type":"[^"]*","status":"[^"]*","err":"[^"]*"' <<<"$out" | grep -v '"status":"running"' | head -n 5 |
+                    sed -E 's/"name":"([^"]*)","type":"[^"]*","status":"([^"]*)","err":"([^"]*)"/    \1: \2 \3/'
+            fi
+        fi
+    else
+        port=${T[BIND_PORT]}
+        if [ -n "$(ss -H -lnt "sport = :$port" 2>/dev/null)" ]; then
+            ok "Tunnel port $port is open on this server"
+        else
+            err "Nothing listens on tunnel port $port"
+        fi
+        out=$(curl -s -m 5 -u "${T[ADMIN_USER]}:${T[ADMIN_PASS]}" "http://127.0.0.1:${T[ADMIN_PORT]}/api/serverinfo" 2>/dev/null)
+        cc=$(grep -oE '"clientCounts":[0-9]+' <<<"$out" | cut -d: -f2)
+        if [ "${cc:-0}" -gt 0 ]; then
+            ok "$cc client connected from the $other server"
+        else
+            warn "The $other server has not connected yet"
+            diag_fix "Run Diagnose on the $other server too, it shows the reason from its side"
+            diag_fix "Port $port must be open for the $other server: firewall here is $(fw_kind), also check the provider panel"
+        fi
+        if bind_here && [ "${cc:-0}" -gt 0 ] && parse_ports "${T[PORTS]}"; then
+            for t in tcp udp; do
+                [[ ${T[PTYPE]} == both || ${T[PTYPE]} == "$t" ]] || continue
+                scan_listen "${t:0:1}"
+                for p in "${PORT_LIST[@]}"; do
+                    [ -n "${LMAP[$p]}" ] || miss+="$p/$t "
+                done
+            done
+            if [ -n "$miss" ]; then
+                err "VPN config ports not open yet: $(short_list "$miss")"
+                diag_fix "Make sure the same VPN config ports are set on both servers"
+            else
+                ok "All VPN config ports are open on this server"
+            fi
+        fi
+    fi
+    if grep -q 'connect to local service' <<<"$log"; then
+        warn "Nothing answered on a VPN config port of this server recently"
+        diag_fix "Check that your VPN inbound runs on this server with the same port"
+    fi
+    line=$(diag_log_line "$log")
+    if [ -n "$line" ]; then
+        section "Latest tunnel message"
+        cnext
+        printf '  \e[38;5;%sm%s\e[0m\n' "$NC" "$(trunc "$(sed -E 's/^[0-9-]+ [0-9:.]+ //' <<<"$line")" 100)"
+        diag_explain "$line" "$other" "$port" || true
+    fi
+}
+
 logs_menu() {
     local n c
-    header "LOGS & STATUS"
+    header "LOGS & DIAGNOSE"
     pick_tunnel n || return
     while :; do
         header "LOGS: $n"
-        item 1 "Live log"
-        item 2 "Service status"
-        item 3 "Last 100 lines"
-        item 4 "Watchdog log"
+        item 1 "Diagnose connection"
+        item 2 "Live log"
+        item 3 "Service status"
+        item 4 "Last 100 lines"
+        item 5 "Watchdog log"
         item 0 "Back"
-        menu_pick c 4
+        menu_pick c 5
         blank
         case $c in
-            1) live_log "$n" ;;
-            2)
+            1)
+                tunnel_diagnose "$n"
+                pause
+                ;;
+            2) live_log "$n" ;;
+            3)
                 systemctl status "frp-$n.service" --no-pager -l 2>&1 | head -n 25
                 for c in provider wss; do
                     [ -f "$UNIT_DIR/frp-$n-$c.service" ] && blank && systemctl status "frp-$n-$c.service" --no-pager -l 2>&1 | head -n 12
                 done
                 pause
                 ;;
-            3)
+            4)
                 journalctl -n 100 --no-pager -o short-iso -u "frp-$n.service" -u "frp-$n-provider.service" -u "frp-$n-wss.service" 2>&1
                 pause
                 ;;
-            4)
+            5)
                 if [ -s "$LOG_DIR/watchdog.log" ]; then tail -n 40 "$LOG_DIR/watchdog.log"; else info "Watchdog log is empty"; fi
                 pause
                 ;;
             0) return ;;
         esac
     done
-}
-
-declare -A GH=()
-GSEC=()
-GPROTOS=()
-
-is_group_name() { [[ $1 =~ ^[a-z0-9]{1,7}$ ]]; }
-is_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
-
-proto_suffix() {
-    if [ "$1" = websocket ]; then printf 'ws'; else printf '%s' "$1"; fi
-}
-
-gen_uuid() {
-    local u
-    local h
-    u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
-    if ! is_uuid "$u"; then
-        h=$(openssl rand -hex 16)
-        u="${h:0:8}-${h:8:4}-4${h:13:3}-a${h:17:3}-${h:20:12}"
-    fi
-    printf '%s' "$u"
-}
-
-group_members() {
-    sed -n 's/^TUNNELS=//p' "$GROUP_DIR/$1.conf" 2>/dev/null | head -n 1 | tr ',' ' '
-}
-
-group_get() {
-    sed -n "s/^$2=//p" "$GROUP_DIR/$1.conf" 2>/dev/null | head -n 1
-}
-
-group_taken() {
-    local p
-    [ -e "$GROUP_DIR/$1.conf" ] && return 0
-    for p in tcp kcp quic ws; do
-        [ -e "$TUN_DIR/$1-$p" ] && return 0
-    done
-    return 1
-}
-
-v_new_group() {
-    is_group_name "$1" || {
-        err "Use 1-7 characters: a-z, 0-9"
-        return 1
-    }
-    if group_taken "$1"; then
-        err "Group '$1' already exists"
-        return 1
-    fi
-    return 0
-}
-
-next_group() {
-    local i=1 g=multi
-    while group_taken "$g"; do
-        i=$((i + 1))
-        g="multi$i"
-    done
-    printf '%s' "$g"
-}
-
-v_protos() {
-    local x plist=" "
-    local -a a
-    IFS=, read -ra a <<<"${1//[[:space:]]/}"
-    if ((${#a[@]} < 2 || ${#a[@]} > 4)); then
-        err "Pick 2 to 4 of: tcp, kcp, quic, websocket"
-        return 1
-    fi
-    for x in "${a[@]}"; do
-        [ "$x" = ws ] && x=websocket
-        if [[ ! $x =~ ^(tcp|kcp|quic|websocket)$ ]]; then
-            err "Unknown protocol: ${x:-empty}"
-            return 1
-        fi
-        if [[ $plist == *" $x "* ]]; then
-            err "Protocol listed twice: $x"
-            return 1
-        fi
-        plist+="$x "
-    done
-    read -ra GPROTOS <<<"$plist"
-    return 0
-}
-
-free_run() {
-    local p=$1 n=$2 i ok
-    scan_listen t
-    while ((p + n - 1 <= 65535)); do
-        ok=1
-        for ((i = 0; i < n; i++)); do
-            if [ -n "${LMAP[$((p + i))]}" ] || [[ " $3 " == *" $((p + i)) "* ]]; then
-                ok=0
-                p=$((p + i + 1))
-                break
-            fi
-        done
-        if [ "$ok" = 1 ]; then
-            printf '%s' "$p"
-            return 0
-        fi
-    done
-    return 1
-}
-
-v_panel_base() {
-    local i p o
-    is_port "$1" || {
-        err "Port must be between 1 and 65535"
-        return 1
-    }
-    if (($1 + ${#GPROTOS[@]} - 1 > 65535)); then
-        err "Not enough ports after $1"
-        return 1
-    fi
-    if r443_present && (($1 <= R443_MAX && $1 + ${#GPROTOS[@]} - 1 >= R443_MIN)); then
-        err "reality443 uses ports $R443_MIN-$R443_MAX for its inbounds. Pick a port outside this range."
-        return 1
-    fi
-    for ((i = 0; i < ${#GPROTOS[@]}; i++)); do
-        p=$(($1 + i))
-        if o=$(port_owner "$p" tcp); then
-            err "Port $p is already in use by $o"
-            return 1
-        fi
-    done
-    return 0
-}
-
-alloc_tunnel_port() {
-    local p=$1 x
-    while :; do
-        x=$(alloc_port "$p" "$3") || return 1
-        if [[ $2 == kcp || $2 == quic ]]; then
-            scan_listen u
-            if [ -n "${LMAP[$x]}" ]; then
-                p=$((x + 1))
-                continue
-            fi
-        fi
-        printf '%s' "$x"
-        return 0
-    done
-}
-
-group_key_make() {
-    local g=$1 x
-    {
-        printf 'V=1\nGROUP=%s\nUUID=%s\nXPORT=%s\n' "$g" "$(group_get "$g" UUID)" "$(group_get "$g" XPORT)"
-        for x in $(group_members "$g"); do
-            tunnel_load "$x" || continue
-            printf -- '---\n'
-            key_lines
-        done
-    } | gzip -9c | base64 -w0 | sed "s/^/$GKEY_PREFIX/"
-}
-
-group_key_parse() {
-    local data line k n=-1 i
-    GH=()
-    GSEC=()
-    [[ $1 == "$GKEY_PREFIX"* ]] || return 1
-    data=$(key_decode "$1" "$GKEY_PREFIX") || return 1
-    while IFS= read -r line; do
-        if [ "$line" = "---" ]; then
-            n=$((n + 1))
-            GSEC[n]=""
-            continue
-        fi
-        if ((n < 0)); then
-            k=${line%%=*}
-            [[ $k =~ ^[A-Z_]+$ ]] && GH[$k]=${line#*=}
-        else
-            GSEC[n]+="$line"$'\n'
-        fi
-    done <<<"$data"
-    [ "${GH[V]}" = 1 ] && is_group_name "${GH[GROUP]}" && is_uuid "${GH[UUID]}" && is_port "${GH[XPORT]}" || return 1
-    ((${#GSEC[@]} >= 2 && ${#GSEC[@]} <= 4)) || return 1
-    for ((i = 0; i < ${#GSEC[@]}; i++)); do
-        key_load "${GSEC[i]}"
-        key_valid || return 1
-        [ "${K[ROLE]}" = iran ] && [ "${K[MODE]}" = reverse ] || return 1
-    done
-    return 0
-}
-
-group_key_show() {
-    local g=$1 k f="$GROUP_DIR/$1/connection.key"
-    k=$(group_key_make "$g")
-    mkdir -p "$GROUP_DIR/$g"
-    printf '%s\n' "$k" >"$f"
-    chmod 600 "$f"
-    section "Multi-protocol key for the Kharej server"
-    cnext
-    printf '\n\e[38;5;%sm%s\e[0m\n\n' "$NC" "$k"
-    info "Saved to $f"
-    warn "Keep this key private. It contains the tunnel token and the VLESS UUID."
-}
-
-group_write() {
-    local g=$1 role=$2 uuid=$3 xport=$4 base=$5 protos=$6 members=$7
-    mkdir -p "$GROUP_DIR/$g"
-    chmod 700 "$GROUP_DIR" "$GROUP_DIR/$g"
-    printf 'GROUP=%s\nROLE=%s\nUUID=%s\nXPORT=%s\nBASE=%s\nPROTOS=%s\nTUNNELS=%s\nCREATED=%s\n' \
-        "$g" "$role" "$uuid" "$xport" "$base" "$protos" "$members" "$(date '+%F %T')" >"$GROUP_DIR/$g.conf"
-    chmod 600 "$GROUP_DIR/$g.conf"
-}
-
-iran_xray_json() {
-    local g=$1 uuid=$2 base=$3 i n first sep
-    shift 3
-    n=$#
-    first="$g-$(proto_suffix "$1")"
-    printf '{\n  "outbounds": [\n'
-    for ((i = 0; i < n; i++)); do
-        sep=","
-        ((i == n - 1)) && sep=""
-        printf '    {"tag": "%s-%s", "protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": %s, "users": [{"id": "%s", "encryption": "none"}]}]}, "streamSettings": {"network": "tcp", "security": "none"}}%s\n' \
-            "$g" "$(proto_suffix "$1")" "$((base + i))" "$uuid" "$sep"
-        shift
-    done
-    printf '  ],\n'
-    printf '  "observatory": {"subjectSelector": ["%s-"], "probeURL": "https://www.google.com/generate_204", "probeInterval": "15s", "enableConcurrency": true},\n' "$g"
-    printf '  "routing": {\n'
-    printf '    "balancers": [{"tag": "%s-auto", "selector": ["%s-"], "strategy": {"type": "leastPing"}, "fallbackTag": "%s"}],\n' "$g" "$g" "$first"
-    printf '    "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "%s-auto"}]\n' "$g"
-    printf '  }\n}\n'
-}
-
-kharej_xray_json() {
-    local g=$1 uuid=$2 xport=$3
-    printf '{\n  "log": {"loglevel": "warning"},\n  "inbounds": [\n'
-    printf '    {"tag": "%s-in", "listen": "127.0.0.1", "port": %s, "protocol": "vless", "settings": {"clients": [{"id": "%s"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "none"}}\n' "$g" "$xport" "$uuid"
-    printf '  ],\n  "outbounds": [\n    {"tag": "direct", "protocol": "freedom"}\n  ]\n}\n'
-}
-
-kharej_inbound_guide() {
-    if [ -n "$3" ]; then section "Xray inbound on this server"; else section "Xray inbound on the Kharej server"; fi
-    info "Create one VLESS inbound in your Kharej panel or Xray:"
-    kv "Listen IP" "127.0.0.1"
-    kv "Port" "$2"
-    kv "Protocol" "vless, transmission TCP, security none"
-    kv "Client ID (UUID)" "$1"
-    [ -n "$3" ] && kv "Full Xray config" "$3"
-}
-
-iran_panel_guide() {
-    local g=$1 f=$2 first=$3
-    section "Iran panel setup"
-    info "Xray config with outbounds, balancer, observatory and rule:"
-    kv "File" "$f"
-    say "1. In the panel add the outbounds from the file (3x-ui: Outbounds, JSON tab, one line each)"
-    say "2. Add a balancer: tag $g-auto, strategy Least ping, selector $g-, fallback $first"
-    say "3. Add a routing rule: network tcp,udp to balancer $g-auto, keep it below block and direct rules"
-    say "4. Set the observatory probe interval to 15s, then Save and restart Xray"
-    info "Marzban: paste the parts of the file into Core Settings"
-}
-
-multi_create_iran() {
-    local g ip xport base tp next ex i x sfx uuid token members="" f
-    local -a protos tports names
-    section "Multi-protocol tunnel on Iran"
-    ask g "Group name" "$(next_group)" v_new_group "-"
-    ask x "Protocols" "tcp,kcp,quic,websocket" v_protos "-"
-    protos=("${GPROTOS[@]}")
-    get_public_ip
-    ask ip "Iran IP" "$PUBIP" is_host "Enter a valid IP or domain"
-    ask xport "Kharej VPN inbound port" "10808" is_port "Port must be between 1 and 65535"
-    ask base "First Iran panel port" "$(free_run 20808 "${#protos[@]}")" v_panel_base "-"
-    ex=""
-    for ((i = 0; i < ${#protos[@]}; i++)); do ex+=" $((base + i))"; done
-    next=7000
-    for x in "${protos[@]}"; do
-        tp=$(alloc_tunnel_port "$next" "$x" "$ex") || {
-            err "No free tunnel port found"
-            return 1
-        }
-        tports+=("$tp")
-        ex+=" $tp"
-        next=$((tp + 1))
-    done
-    section "Summary"
-    for ((i = 0; i < ${#protos[@]}; i++)); do
-        names+=("$g-$(proto_suffix "${protos[i]}")")
-        kv "${names[i]}" "${protos[i]}, tunnel port ${tports[i]}, panel 127.0.0.1:$((base + i)) -> Kharej $xport"
-    done
-    kv "Iran IP" "$ip"
-    blank
-    confirm "Create these tunnels?" y || {
-        warn "Cancelled"
-        return 1
-    }
-    blank
-    uuid=$(gen_uuid)
-    token=$(rand_str 32)
-    EXTRA_EXCL=$ex
-    for ((i = 0; i < ${#protos[@]}; i++)); do
-        T=()
-        T[NAME]=${names[i]}
-        T[ROLE]=iran
-        T[MODE]=reverse
-        derive_side
-        T[PROTO]=${protos[i]}
-        T[BIND_ADDR]=0.0.0.0
-        T[BIND_PORT]=${tports[i]}
-        T[PUB_ADDR]=$ip
-        T[TOKEN]=$token
-        T[TLS]=y
-        T[CERT_MODE]=builtin
-        T[PORTS]=$xport
-        T[PTYPE]=tcp
-        T[ROFF]=$((base + i - xport))
-        T[LISTEN]=local
-        T[RESTRICT]=y
-        T[GROUP]=$g
-        tunnel_defaults
-        say "Creating ${names[i]} (${protos[i]})"
-        if tunnel_apply; then
-            members+="${members:+,}${names[i]}"
-        else
-            err "Tunnel ${names[i]} was not started"
-        fi
-    done
-    EXTRA_EXCL=""
-    [ -n "$members" ] || return 1
-    group_write "$g" iran "$uuid" "$xport" "$base" "$(
-        IFS=,
-        printf '%s' "${protos[*]}"
-    )" "$members"
-    f="$GROUP_DIR/$g/iran-xray.json"
-    iran_xray_json "$g" "$uuid" "$base" "${protos[@]}" >"$f"
-    chmod 600 "$f"
-    ok "Multi-protocol group '$g' created"
-    group_key_show "$g"
-    section "Next steps"
-    say "On the Kharej server: Multi-protocol tunnel, Kharej, paste the key above"
-    kharej_inbound_guide "$uuid" "$xport" ""
-    iran_panel_guide "$g" "$f" "${names[0]}"
-}
-
-multi_import_kharej() {
-    local c k g ip i sfx members="" f n
-    cnext
-    c=$NC
-    while :; do
-        printf '  \e[38;5;%sm%s\e[0m\n  ' "$c" "Multi-protocol key from the Iran server, Enter to cancel:"
-        if ! IFS= read -r -e k; then
-            printf '\e[0m\n'
-            exit 0
-        fi
-        k=${k//[[:space:]]/}
-        [ -z "$k" ] && return 1
-        if [[ $k == "$KEY_PREFIX"* ]]; then
-            err "This is a single tunnel key. Use Create tunnel in the main menu."
-            continue
-        fi
-        group_key_parse "$k" && break
-        err "Invalid multi-protocol key"
-    done
-    g=${GH[GROUP]}
-    if group_taken "$g"; then
-        err "Group '$g' already exists on this server. Delete it first with Delete tunnel, then paste the key again."
-        return 1
-    fi
-    n=${#GSEC[@]}
-    key_load "${GSEC[0]}"
-    ok "Key accepted: $n tunnels for group '$g'"
-    ask ip "Iran IP" "${K[ADDR]}" is_host "Enter a valid IP or domain"
-    section "Summary"
-    for ((i = 0; i < n; i++)); do
-        key_load "${GSEC[i]}"
-        sfx=${K[NAME]##*-}
-        kv "$g-$sfx" "${K[PROTO]}, Iran $ip:${K[PORT]} -> this server 127.0.0.1:${GH[XPORT]}"
-    done
-    if ! port_owner "${GH[XPORT]}" tcp >/dev/null; then
-        warn "Nothing listens on port ${GH[XPORT]} yet. Create the Xray inbound shown below."
-    fi
-    blank
-    confirm "Create these tunnels?" y || {
-        warn "Cancelled"
-        return 1
-    }
-    blank
-    for ((i = 0; i < n; i++)); do
-        key_load "${GSEC[i]}"
-        T=()
-        key_apply
-        sfx=${K[NAME]##*-}
-        T[NAME]="$g-$sfx"
-        T[SERVER_ADDR]=$ip
-        T[TARGET_IP]=127.0.0.1
-        T[GROUP]=$g
-        tunnel_defaults
-        say "Creating ${T[NAME]} (${T[PROTO]})"
-        if tunnel_apply; then
-            members+="${members:+,}${T[NAME]}"
-        else
-            err "Tunnel ${T[NAME]} was not started"
-        fi
-    done
-    [ -n "$members" ] || return 1
-    group_write "$g" foreign "${GH[UUID]}" "${GH[XPORT]}" "" "" "$members"
-    f="$GROUP_DIR/$g/kharej-xray.json"
-    kharej_xray_json "$g" "${GH[UUID]}" "${GH[XPORT]}" >"$f"
-    chmod 600 "$f"
-    ok "Multi-protocol group '$g' created"
-    kharej_inbound_guide "${GH[UUID]}" "${GH[XPORT]}" "$f"
-    info "Done. No need to paste anything on the Iran server."
-}
-
-multi_menu() {
-    local c
-    need_frp || return
-    header "MULTI-PROTOCOL TUNNEL"
-    info "One tunnel per protocol. Xray on the Iran panel picks the best one automatically."
-    choose c "This server is" 1 "Iran" "Kharej"
-    blank
-    if [ "$c" = 1 ]; then
-        multi_create_iran
-    else
-        multi_import_kharej
-    fi
-    pause
 }
 
 LIP_KEYS=(NAME TYPE ROLE IFACE LOCAL REMOTE V4 PEER4 V6 PEER6 MTU VNI DPORT DEV CREATED)
@@ -4170,35 +3858,33 @@ main_menu() {
     blank
     item 1 "Install / Update FRP"
     item 2 "Create tunnel"
-    item 3 "Multi-protocol tunnel"
-    item 4 "Tunnels"
-    item 5 "Edit tunnel"
-    item 6 "Delete tunnel"
-    item 7 "Service control"
-    item 8 "Logs & status"
-    item 9 "Local IP"
-    item 10 "Certificates"
-    item 11 "Network optimize"
-    item 12 "Watchdog"
-    item 13 "Backup & restore"
-    item 14 "Uninstall"
+    item 3 "Tunnels"
+    item 4 "Edit tunnel"
+    item 5 "Delete tunnel"
+    item 6 "Service control"
+    item 7 "Logs & diagnose"
+    item 8 "Local IP"
+    item 9 "Certificates"
+    item 10 "Network optimize"
+    item 11 "Watchdog"
+    item 12 "Backup & restore"
+    item 13 "Uninstall"
     item 0 "Exit"
-    menu_pick c 14
+    menu_pick c 13
     case $c in
         1) frp_menu ;;
         2) tunnel_create ;;
-        3) multi_menu ;;
-        4) tunnels_menu ;;
-        5) tunnel_edit ;;
-        6) tunnel_delete ;;
-        7) svc_menu ;;
-        8) logs_menu ;;
-        9) lip_menu ;;
-        10) cert_menu ;;
-        11) net_menu ;;
-        12) wd_menu ;;
-        13) backup_menu ;;
-        14) uninstall_all ;;
+        3) tunnels_menu ;;
+        4) tunnel_edit ;;
+        5) tunnel_delete ;;
+        6) svc_menu ;;
+        7) logs_menu ;;
+        8) lip_menu ;;
+        9) cert_menu ;;
+        10) net_menu ;;
+        11) wd_menu ;;
+        12) backup_menu ;;
+        13) uninstall_all ;;
         0)
             printf '\e[0m\n'
             exit 0
