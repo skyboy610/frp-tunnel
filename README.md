@@ -22,6 +22,7 @@ After the first run, the script installs itself as `frp-tunnel`.
 - Port lists and ranges (`443,2000-2010`) for TCP, UDP or both, with checks for ports already in use
 - One systemd service per tunnel (`frp-<name>`) with `Restart=always`
 - A connection key that carries all settings and certificates to the other server
+- Multi-protocol tunnel: one key creates up to 4 tunnels (tcp, kcp, quic, websocket) into one Kharej inbound, with a ready Xray balancer config for the Iran panel
 - Local IPs over GRE, SIT/6to4 or VXLAN, with matching addresses suggested on both sides, persistence through systemd, and a ping test
 - Watchdog that checks the FRP admin API, automatic certificate renewal, BBR/sysctl/ulimit tuning, backup and restore, and uninstall
 - FRP downloads from GitHub, a mirror, a direct link or a local file
