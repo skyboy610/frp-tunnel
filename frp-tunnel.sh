@@ -22,6 +22,10 @@ BBR_FILE="/etc/sysctl.d/99-frp-tunnel-bbr.conf"
 BBR_MOD_FILE="/etc/modules-load.d/frp-tunnel-bbr.conf"
 LIMITS_FILE="/etc/security/limits.d/99-frp-tunnel.conf"
 SDLIMIT_FILE="/etc/systemd/system.conf.d/99-frp-tunnel.conf"
+RES_FILE="/etc/sysctl.d/99-frp-tunnel-ports.conf"
+RES_STATE="$BASE_DIR/reserved.ports"
+R443_MIN=10001
+R443_MAX=19999
 SYS_CA="/etc/ssl/certs/ca-certificates.crt"
 TLS_SNI="frp-tunnel.internal"
 KEY_PREFIX="frpt1:"
@@ -1437,15 +1441,116 @@ fw_lip_apply() {
 }
 
 fw_cli() {
+    local n
     case $1 in
         --fw-sync)
             tunnel_load "$2" && fw_tunnel_apply "$2" sync q
+            res_sync
             ;;
         --fw-sync-lip)
             lip_load_file "$LIP_DIR/$2.conf" && fw_lip_apply "$2" sync q
             ;;
+        --fw-sync-all)
+            while read -r n; do
+                [ -n "$n" ] && tunnel_load "$n" && fw_tunnel_apply "$n" sync q
+            done < <(tunnel_names)
+            while read -r n; do
+                [ -n "$n" ] && lip_load_file "$LIP_DIR/$n.conf" && fw_lip_apply "$n" sync q
+            done < <(lip_names)
+            res_sync
+            ;;
     esac
     return 0
+}
+
+fw_timer_install() {
+    [ -x "$SELF_BIN" ] || return 0
+    [ -f "$UNIT_DIR/frp-tunnel-fw.timer" ] && return 0
+    cat >"$UNIT_DIR/frp-tunnel-fw.service" <<UNIT
+[Unit]
+Description=FRP Tunnel firewall and port reservation sync
+
+[Service]
+Type=oneshot
+ExecStart=$SELF_BIN --fw-sync-all
+UNIT
+    cat >"$UNIT_DIR/frp-tunnel-fw.timer" <<UNIT
+[Unit]
+Description=FRP Tunnel firewall sync timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target
+UNIT
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable --now frp-tunnel-fw.timer >/dev/null 2>&1
+    return 0
+}
+
+res_expand() {
+    local tok
+    local -a toks
+    IFS=, read -ra toks <<<"${1//[[:space:]]/}"
+    for tok in "${toks[@]}"; do
+        if [[ $tok =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        elif [[ $tok =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$tok"
+        fi
+    done
+}
+
+res_collect() {
+    local f
+    for f in "$TUN_DIR"/*/tunnel.conf; do
+        [ -f "$f" ] || continue
+        load_meta "$f" || continue
+        [ "${T[SIDE]}" = server ] && printf '%s\n' "${T[BIND_PORT]}" "${T[INT_PORT]}"
+        printf '%s\n' "${T[ADMIN_PORT]}" "${T[PADMIN_PORT]}"
+        if bind_here && parse_ports "${T[PORTS]}" && bind_port_list; then
+            printf '%s\n' "${BIND_LIST[@]}"
+        fi
+    done | grep -E '^[0-9]+$' | sort -un
+}
+
+res_sync() {
+    local proc=/proc/sys/net/ipv4/ip_local_reserved_ports p cur new="" ours=""
+    local -a mine=()
+    local -A rset=() old=()
+    [ -w "$proc" ] || return 0
+    mapfile -t mine < <( (res_collect))
+    if [ -f "$RES_STATE" ]; then
+        while read -r p; do [ -n "$p" ] && old[$p]=1; done < <(res_expand "$(cat "$RES_STATE")")
+    fi
+    cur=$(cat "$proc" 2>/dev/null)
+    while read -r p; do
+        [ -n "$p" ] && [ -z "${old[$p]}" ] && rset[$p]=1
+    done < <(res_expand "$cur")
+    for p in "${mine[@]}"; do rset[$p]=1; done
+    ((${#rset[@]})) && new=$(ports_compact "${!rset[@]}")
+    ((${#mine[@]})) && ours=$(ports_compact "${mine[@]}")
+    if [ -n "$ours" ]; then
+        printf '%s' "$ours" >"$RES_STATE" 2>/dev/null
+        printf 'net.ipv4.ip_local_reserved_ports = %s\n' "$ours" >"$RES_FILE" 2>/dev/null
+    else
+        rm -f "$RES_STATE" "$RES_FILE"
+    fi
+    printf '%s\n' "$new" >"$proc" 2>/dev/null
+    return 0
+}
+
+r443_present() { [ -d /etc/reality443 ] || [ -x /usr/local/bin/reality-443.sh ]; }
+
+r443_hit() {
+    local p
+    for p in "$@"; do
+        ((p >= R443_MIN && p <= R443_MAX)) && return 0
+    done
+    return 1
 }
 
 fw_exec_pre() {
@@ -1865,6 +1970,8 @@ tunnel_apply() {
     done
     ok "Config files verified"
     fw_tunnel_apply "$n" sync
+    res_sync
+    fw_timer_install
     write_units
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "frp-$n.service" >/dev/null 2>&1
@@ -1890,6 +1997,7 @@ tunnel_remove() {
     systemctl daemon-reload >/dev/null 2>&1
     systemctl reset-failed "frp-$n.service" >/dev/null 2>&1
     rm -rf "${TUN_DIR:?}/$n" "${WD_STATE:?}/$n"
+    res_sync
 }
 
 key_make() {
@@ -2140,6 +2248,9 @@ v_ports_bind() {
     fi
     b=$(busy_ports "${T[PTYPE]}")
     PORT_LIST=("${orig[@]}")
+    if r443_present && r443_hit "${BIND_LIST[@]}"; then
+        warn "reality443 gives ports $R443_MIN-$R443_MAX to its inbounds. A port outside this range is safer."
+    fi
     if [ -n "$b" ]; then
         warn "Already in use: $(short_list "$b")"
         confirm "Use these ports anyway?" n || return 1
@@ -2986,6 +3097,10 @@ v_panel_base() {
         err "Not enough ports after $1"
         return 1
     fi
+    if r443_present && (($1 <= R443_MAX && $1 + ${#GPROTOS[@]} - 1 >= R443_MIN)); then
+        err "reality443 uses ports $R443_MIN-$R443_MAX for its inbounds. Pick a port outside this range."
+        return 1
+    fi
     for ((i = 0; i < ${#GPROTOS[@]}; i++)); do
         p=$(($1 + i))
         if o=$(port_owner "$p" tcp); then
@@ -3135,7 +3250,7 @@ multi_create_iran() {
     get_public_ip
     ask ip "Iran IP" "$PUBIP" is_host "Enter a valid IP or domain"
     ask xport "Kharej VPN inbound port" "10808" is_port "Port must be between 1 and 65535"
-    ask base "First Iran panel port" "$(free_run 10808 "${#protos[@]}")" v_panel_base "-"
+    ask base "First Iran panel port" "$(free_run 20808 "${#protos[@]}")" v_panel_base "-"
     ex=""
     for ((i = 0; i < ${#protos[@]}; i++)); do ex+=" $((base + i))"; done
     next=7000
@@ -3477,6 +3592,7 @@ lip_apply() {
     chmod 755 "$LIP_DIR/$n.sh"
     lip_unit >"$UNIT_DIR/frp-lip-$n.service"
     fw_lip_apply "$n" sync
+    fw_timer_install
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "frp-lip-$n.service" >/dev/null 2>&1
     systemctl restart "frp-lip-$n.service" >/dev/null 2>&1
@@ -3968,10 +4084,11 @@ backup_restore() {
     else
         warn "FRP is not installed. Install it to start the restored tunnels."
     fi
-    for n in frp-tunnel-watchdog.timer frp-tunnel-acme.timer; do
+    for n in frp-tunnel-fw.timer frp-tunnel-watchdog.timer frp-tunnel-acme.timer; do
         [ -f "$UNIT_DIR/$n" ] && systemctl enable --now "$n" >/dev/null 2>&1
     done
     sysctl --system >/dev/null 2>&1
+    res_sync
     ok "Backup restored"
 }
 
@@ -4024,7 +4141,7 @@ uninstall_all() {
         [ -x "$LIP_DIR/$n.sh" ] && "$LIP_DIR/$n.sh" down
         rm -f "$UNIT_DIR/frp-lip-$n.service"
     done < <(lip_names)
-    for u in frp-tunnel-watchdog.timer frp-tunnel-watchdog.service frp-tunnel-acme.timer frp-tunnel-acme.service; do
+    for u in frp-tunnel-fw.timer frp-tunnel-fw.service frp-tunnel-watchdog.timer frp-tunnel-watchdog.service frp-tunnel-acme.timer frp-tunnel-acme.service; do
         systemctl disable --now "$u" >/dev/null 2>&1
         rm -f "$UNIT_DIR/$u"
     done
@@ -4037,6 +4154,7 @@ uninstall_all() {
         confirm "Remove network optimizations?" n && net_revert
     fi
     fw_sync "frp-tunnel-acme" "$CERT_DIR/le/port80.fw" q
+    res_sync
     rm -rf "${BASE_DIR:?}" "$LOG_DIR" "$WD_STATE"
     rm -f "$FRPS_BIN" "$FRPC_BIN" "$SELF_BIN"
     ok "FRP Tunnel has been removed"
@@ -4100,6 +4218,10 @@ main() {
             ;;
         --fw-sync-lip)
             [ "$(id -u)" -eq 0 ] && is_lip_name "$2" && fw_cli "$1" "$2"
+            exit 0
+            ;;
+        --fw-sync-all)
+            [ "$(id -u)" -eq 0 ] && fw_cli "$1"
             exit 0
             ;;
         -v | --version)
