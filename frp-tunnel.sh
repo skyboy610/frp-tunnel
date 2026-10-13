@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-APP_VER="1.0.0"
+APP_VER="1.0.1"
 FRP_DEFAULT_VER="0.71.0"
 BASE_DIR="/etc/frp-tunnel"
 TUN_DIR="$BASE_DIR/tunnels"
@@ -2849,8 +2849,6 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
 EOF
     if sysctl -e -p "$SYSCTL_FILE" >/dev/null 2>&1; then
         ok "Sysctl tuning applied"
