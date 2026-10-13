@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-APP_VER="1.3.0"
+APP_VER="1.4.0"
 FRP_DEFAULT_VER="0.71.0"
 BASE_DIR="/etc/frp-tunnel"
 TUN_DIR="$BASE_DIR/tunnels"
@@ -25,6 +25,19 @@ SDLIMIT_FILE="/etc/systemd/system.conf.d/99-frp-tunnel.conf"
 RES_FILE="/etc/sysctl.d/99-frp-tunnel-ports.conf"
 RES_STATE="$BASE_DIR/reserved.ports"
 EXIT_TEST_URL="https://api.ipify.org"
+XRAY_REPO="https://github.com/XTLS/Xray-core"
+XRAY_DEFAULT_VER="26.3.27"
+XRAY_LIB="/usr/local/lib/frp-tunnel"
+XRAY_BIN="$XRAY_LIB/xray"
+XRAY_DIR="$BASE_DIR/xray"
+XRAY_CONF="$XRAY_DIR/config.json"
+XRAY_SVC="frp-tunnel-xray-exit.service"
+XEXIT_DIR="$BASE_DIR/exits"
+GKEY_PREFIX="frptx1:"
+XPROBE_URL="https://www.google.com/generate_204"
+XPROBE_INT="30s"
+XUI_DEF2='{"log":{"access":"none","dnsLog":false,"error":"","loglevel":"warning","maskAddress":""},"api":{"tag":"api","services":["HandlerService","LoggerService","StatsService"]},"inbounds":[{"tag":"api","listen":"127.0.0.1","port":62789,"protocol":"tunnel","settings":{"address":"127.0.0.1"}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"AsIs","redirect":"","noises":[]}},{"tag":"blocked","protocol":"blackhole","settings":{}}],"policy":{"levels":{"0":{"statsUserDownlink":true,"statsUserUplink":true}},"system":{"statsInboundDownlink":true,"statsInboundUplink":true,"statsOutboundDownlink":false,"statsOutboundUplink":false}},"routing":{"domainStrategy":"AsIs","rules":[{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","outboundTag":"blocked","ip":["geoip:private"]},{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]}]},"stats":{},"metrics":{"tag":"metrics_out","listen":"127.0.0.1:11111"}}'
+XUI_DEF3='{"api":{"services":["HandlerService","LoggerService","StatsService","RoutingService"],"tag":"api"},"inbounds":[{"listen":"127.0.0.1","port":62789,"protocol":"tunnel","settings":{"rewriteAddress":"127.0.0.1"},"tag":"api"}],"log":{"access":"none","dnsLog":false,"error":"","loglevel":"warning","maskAddress":""},"metrics":{"listen":"127.0.0.1:11111","tag":"metrics_out"},"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"block","ip":["geoip:private"]},{"action":"allow"}]},"tag":"direct"},{"protocol":"blackhole","settings":{},"tag":"blocked"}],"policy":{"levels":{"0":{"statsUserDownlink":true,"statsUserUplink":true}},"system":{"statsInboundDownlink":true,"statsInboundUplink":true,"statsOutboundDownlink":false,"statsOutboundUplink":false}},"routing":{"domainStrategy":"AsIs","rules":[{"inboundTag":["api"],"outboundTag":"api","type":"field"},{"ip":["geoip:private"],"outboundTag":"blocked","type":"field"},{"outboundTag":"blocked","protocol":["bittorrent"],"type":"field"}]},"stats":{}}'
 R443_MIN=10001
 R443_MAX=19999
 SYS_CA="/etc/ssl/certs/ca-certificates.crt"
@@ -65,6 +78,11 @@ declare -A L=()
 declare -A LMAP=()
 declare -A EXCL=()
 declare -A OTHERS=()
+declare -A GH=()
+GSEC=()
+GPROTOS=()
+GKEY=n
+EXTRA_EXCL=""
 PORT_LIST=()
 TNAMES=()
 LNAMES=()
@@ -503,7 +521,7 @@ idle_ports() {
 
 alloc_port() {
     local p=$1 ex=" $2 " used
-    used=" $(grep -hoE '^(ADMIN_PORT|PADMIN_PORT|INT_PORT|BIND_PORT)=[0-9]+' "$TUN_DIR"/*/tunnel.conf 2>/dev/null | cut -d= -f2 | tr '\n' ' ') "
+    used=" $(grep -hoE '^(ADMIN_PORT|PADMIN_PORT|INT_PORT|BIND_PORT|XPORT)=[0-9]+' "$TUN_DIR"/*/tunnel.conf 2>/dev/null | cut -d= -f2 | tr '\n' ' ') "
     scan_listen t
     while ((p < 65000)); do
         if [[ $used != *" $p "* && $ex != *" $p "* ]] && [ -z "${LMAP[$p]}" ]; then
@@ -779,6 +797,10 @@ for m in "\$TD"/*/tunnel.conf; do
         fi
     fi
 done
+if systemctl is-enabled --quiet "$XRAY_SVC" 2>/dev/null && ! systemctl is-active --quiet "$XRAY_SVC"; then
+    systemctl restart "$XRAY_SVC"
+    lg "xray exit: service was down, restarted"
+fi
 exit 0
 EOF
     chmod 755 "$HOOK_DIR/cert-reload.sh" "$HOOK_DIR/watchdog.sh"
@@ -1508,7 +1530,7 @@ res_collect() {
         [ -f "$f" ] || continue
         load_meta "$f" || continue
         [ "${T[SIDE]}" = server ] && printf '%s\n' "${T[BIND_PORT]}" "${T[INT_PORT]}"
-        printf '%s\n' "${T[ADMIN_PORT]}" "${T[PADMIN_PORT]}"
+        printf '%s\n' "${T[ADMIN_PORT]}" "${T[PADMIN_PORT]}" "${T[XPORT]}"
         if bind_here && parse_ports "${T[PORTS]}"; then
             printf '%s\n' "${PORT_LIST[@]}"
         fi
@@ -1556,7 +1578,7 @@ fw_exec_pre() {
     return 0
 }
 
-META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE LISTEN TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP KIND SOCKS_USER SOCKS_PASS CREATED)
+META_KEYS=(NAME PFX ROLE MODE METHOD SIDE PROTO BIND_ADDR BIND_PORT INT_PORT PUB_ADDR SERVER_ADDR SERVER_PORT TOKEN TLS CERT_MODE CERT_REF MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE LISTEN TARGET_IP RESTRICT SK ADMIN_PORT ADMIN_USER ADMIN_PASS PADMIN_PORT LIP KIND XMODE GROUP UUID XPORT SOCKS_USER SOCKS_PASS CREATED)
 
 tunnel_names() {
     local f
@@ -1734,6 +1756,11 @@ gen_client_head() {
 is_exit() { [ "${T[KIND]}" = exit ]; }
 
 gen_exit_proxy() {
+    if [ "${T[XMODE]}" = xray ]; then
+        printf '\n[[proxies]]\nname = "%s-vless"\ntype = "tcp"\nlocalIP = "127.0.0.1"\nlocalPort = %s\nremotePort = %s\n' "${T[PFX]}" "${T[XPORT]}" "${T[PORTS]}"
+        [ "${T[COMPRESS]}" = y ] && printf 'transport.useCompression = true\n'
+        return 0
+    fi
     printf '\n[[proxies]]\nname = "%s-socks"\ntype = "tcp"\nremotePort = %s\n' "${T[PFX]}" "${T[PORTS]}"
     [ "${T[COMPRESS]}" = y ] && printf 'transport.useCompression = true\n'
     printf '[proxies.plugin]\ntype = "socks5"\nusername = "%s"\npassword = "%s"\n' "${T[SOCKS_USER]}" "${T[SOCKS_PASS]}"
@@ -1856,6 +1883,10 @@ write_units() {
     else
         bin=$FRPC_BIN
         cfg="$d/frpc.toml"
+        if [ "${T[XMODE]}" = xray ]; then
+            after+=" $XRAY_SVC"
+            wants+=" $XRAY_SVC"
+        fi
     fi
     if [ -n "${T[LIP]}" ] && [ -f "$UNIT_DIR/frp-lip-${T[LIP]}.service" ]; then
         after=" frp-lip-${T[LIP]}.service"
@@ -1896,6 +1927,7 @@ tunnel_defaults() {
     if is_exit; then
         T[LISTEN]=local
         T[PTYPE]=tcp
+        T[XMODE]=${T[XMODE]:-socks}
     fi
     T[MTLS]=${T[MTLS]:-n}
 }
@@ -1905,7 +1937,7 @@ tunnel_finalize() {
     tunnel_defaults
     T[PFX]=${T[PFX]:-${T[NAME]}}
     parse_ports "${T[PORTS]}" || PORT_LIST=()
-    ex=" ${PORT_LIST[*]} ${T[BIND_PORT]} "
+    ex=" ${PORT_LIST[*]} ${T[BIND_PORT]} $EXTRA_EXCL "
     if [ "${T[METHOD]}" = stcp ]; then
         [ -n "${T[SK]}" ] || T[SK]=$(rand_str 24)
     else
@@ -1976,7 +2008,8 @@ tunnel_apply() {
 }
 
 tunnel_remove() {
-    local n=$1 u
+    local n=$1 u x
+    x="$(meta_get "$n" XMODE):$(meta_get "$n" SIDE)"
     for u in "frp-$n.service" "frp-$n-provider.service" "frp-$n-wss.service"; do
         systemctl disable --now "$u" >/dev/null 2>&1
         rm -f "$UNIT_DIR/$u"
@@ -1986,6 +2019,8 @@ tunnel_remove() {
     systemctl reset-failed "frp-$n.service" >/dev/null 2>&1
     rm -rf "${TUN_DIR:?}/$n" "${WD_STATE:?}/$n"
     res_sync
+    [ "$x" = xray:client ] && xray_sync
+    return 0
 }
 
 key_make() {
@@ -2006,7 +2041,7 @@ key_lines() {
     a=("V=1" "NAME=${T[NAME]}" "PFX=${T[PFX]}" "ROLE=${T[ROLE]}" "MODE=${T[MODE]}" "METHOD=${T[METHOD]}" "PROTO=${T[PROTO]}"
         "ADDR=$addr" "PORT=$port" "TOKEN=${T[TOKEN]}" "TLS=${T[TLS]}" "CERT=${T[CERT_MODE]}" "REF=${T[CERT_REF]}"
         "MTLS=${T[MTLS]}" "TCPMUX=${T[TCPMUX]}" "COMPRESS=${T[COMPRESS]}" "POOL=${T[POOL]}" "HB_INT=${T[HB_INT]}"
-        "HB_TO=${T[HB_TO]}" "PORTS=${T[PORTS]}" "PTYPE=${T[PTYPE]}" "SK=${T[SK]}" "RESTRICT=${T[RESTRICT]}" "KIND=${T[KIND]}" "SOCKS_USER=${T[SOCKS_USER]}" "SOCKS_PASS=${T[SOCKS_PASS]}")
+        "HB_TO=${T[HB_TO]}" "PORTS=${T[PORTS]}" "PTYPE=${T[PTYPE]}" "SK=${T[SK]}" "RESTRICT=${T[RESTRICT]}" "KIND=${T[KIND]}" "XMODE=${T[XMODE]}" "GROUP=${T[GROUP]}" "SOCKS_USER=${T[SOCKS_USER]}" "SOCKS_PASS=${T[SOCKS_PASS]}")
     if [ "${T[CERT_MODE]}" = self ] && [ "${T[SIDE]}" = server ]; then
         [ -f "$CP_CA" ] && a+=("CA=$(base64 -w0 <"$CP_CA")")
         if [ "${T[MTLS]}" = y ] && [ -f "$CP_CCRT" ] && [ -f "$CP_CKEY" ]; then
@@ -2027,10 +2062,14 @@ key_valid() {
     [[ ${K[TCPMUX]} =~ ^[yn]$ && ${K[COMPRESS]} =~ ^[yn]$ && ${K[RESTRICT]} =~ ^[yn]$ ]] || return 1
     v_pool "${K[POOL]}" && v_hb "${K[HB_INT]}" && v_hb "${K[HB_TO]}" || return 1
     [[ ${K[PTYPE]} =~ ^(tcp|udp|both)$ ]] || return 1
-    [[ ${K[KIND]} =~ ^(|forward|exit)$ ]] || return 1
+    [[ ${K[KIND]} =~ ^(|forward|exit)$ && ${K[XMODE]} =~ ^(|socks|xray)$ ]] || return 1
     if [ "${K[KIND]}" = exit ]; then
-        [[ ${K[SOCKS_USER]} =~ ^[A-Za-z0-9]{4,64}$ && ${K[SOCKS_PASS]} =~ ^[A-Za-z0-9]{8,64}$ ]] || return 1
         is_port "${K[PORTS]}" && [ "${K[MODE]}" = reverse ] || return 1
+        if [ "${K[XMODE]}" = xray ]; then
+            is_group_name "${K[GROUP]}" || return 1
+        else
+            [[ ${K[SOCKS_USER]} =~ ^[A-Za-z0-9]{4,64}$ && ${K[SOCKS_PASS]} =~ ^[A-Za-z0-9]{8,64}$ ]] || return 1
+        fi
     fi
     parse_ports "${K[PORTS]}" || return 1
     [ -z "${K[SK]}" ] || is_token "${K[SK]}" || return 1
@@ -2071,6 +2110,7 @@ key_parse() {
 
 key_prompt() {
     local c k
+    GKEY=n
     cnext
     c=$NC
     while :; do
@@ -2081,6 +2121,16 @@ key_prompt() {
         fi
         k=${k//[[:space:]]/}
         [ -z "$k" ] && return 1
+        if [[ $k == "$GKEY_PREFIX"* ]]; then
+            if xgroup_key_parse "$k"; then
+                GKEY=y
+                [ "${T[ROLE]}" = iran ] && warn "This key comes from the Iran server, so this server is set to Kharej"
+                T[ROLE]=foreign
+                return 0
+            fi
+            err "Invalid connection key"
+            continue
+        fi
         if ! key_parse "$k"; then
             err "Invalid connection key"
             continue
@@ -2098,7 +2148,7 @@ key_apply() {
     derive_side
     T[METHOD]=${K[METHOD]}
     local k
-    for k in PROTO TOKEN TLS MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE SK RESTRICT KIND SOCKS_USER SOCKS_PASS; do
+    for k in PROTO TOKEN TLS MTLS TCPMUX COMPRESS POOL HB_INT HB_TO PORTS PTYPE SK RESTRICT KIND XMODE GROUP SOCKS_USER SOCKS_PASS; do
         T[$k]=${K[$k]}
     done
     T[PFX]=${K[PFX]:-${K[NAME]}}
@@ -2159,6 +2209,14 @@ key_differs() {
 
 key_show() {
     local k f="$TUN_DIR/${T[NAME]}/connection.key"
+    if is_xexit; then
+        if [ "${T[SIDE]}" = server ]; then
+            xgroup_key_show "${T[GROUP]}"
+        else
+            info "The key of an Xray exit is made on the Iran server"
+        fi
+        return
+    fi
     k=$(key_make)
     printf '%s\n' "$k" >"$f"
     chmod 600 "$f"
@@ -2170,9 +2228,731 @@ key_show() {
     warn "Keep this key private. It contains the token and certificates."
 }
 
+xray_arch() {
+    local m d
+    m=$(uname -m)
+    d=$(dpkg --print-architecture 2>/dev/null)
+    case $m in
+        x86_64 | amd64) printf '64' ;;
+        i?86 | x86) printf '32' ;;
+        aarch64 | arm64 | armv8 | armv8b) printf 'arm64-v8a' ;;
+        armv8l | armv7*) printf 'arm32-v7a' ;;
+        armv6*) printf 'arm32-v6' ;;
+        armv5*) printf 'arm32-v5' ;;
+        riscv64) printf 'riscv64' ;;
+        s390x) printf 's390x' ;;
+        ppc64le) printf 'ppc64le' ;;
+        loongarch64 | loong64) printf 'loong64' ;;
+        mips64) if [[ $d == *el ]]; then printf 'mips64le'; else printf 'mips64'; fi ;;
+        mips) if [[ $d == *el ]]; then printf 'mips32le'; else printf 'mips32'; fi ;;
+        *) return 1 ;;
+    esac
+}
+
+xray_installed() { [ -x "$XRAY_BIN" ]; }
+
+xray_version() { "$XRAY_BIN" version 2>/dev/null | awk 'NR == 1 {print $2}'; }
+
+need_xray() {
+    xray_installed && return 0
+    warn "Xray is not installed on this server"
+    info "The Kharej side of an Xray exit runs Xray core. No panel is needed."
+    if confirm "Install it now?" y; then
+        xray_menu
+    fi
+    xray_installed
+}
+
+xray_tag_of() { sed -nE 's#.*/releases/tag/v?([0-9]+\.[0-9]+\.[0-9]+)/?$#\1#p' | tail -n 1; }
+
+xray_latest() {
+    local pre=$1 v
+    v=$(curl -fsIL -m 10 -o /dev/null -w '%{url_effective}' "${pre}$XRAY_REPO/releases/latest" 2>/dev/null | xray_tag_of)
+    if ! is_ver "$v"; then
+        v=$(curl -fsI -m 10 "${pre}$XRAY_REPO/releases/latest" 2>/dev/null | tr -d '\r' | sed -nE 's/^[Ll]ocation: *//p' | xray_tag_of)
+    fi
+    if ! is_ver "$v"; then
+        v=$(curl -fsSL -m 10 "${pre}https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | grep -m 1 '"tag_name"' | sed -E 's/.*"v?([0-9.]+)".*/\1/')
+    fi
+    is_ver "$v" && printf '%s' "$v"
+}
+
+xray_dgst_sha() { tr -d '\r' | sed -nE 's/^SHA(2-)?256= *([0-9A-Fa-f]{64}) *$/\2/p' | head -n 1 | tr 'A-F' 'a-f'; }
+
+xray_sha_check() {
+    local f=$1 url=$2 want got
+    want=$(curl -fsSL -m 20 "$url.dgst" 2>/dev/null | xray_dgst_sha)
+    [ -n "$want" ] || return 2
+    got=$(sha256sum "$f" | cut -d ' ' -f 1)
+    [ "$got" = "$want" ] && return 0
+    return 1
+}
+
+xray_unzip() {
+    local z=$1 d=$2
+    command -v unzip >/dev/null 2>&1 || apt_install unzip
+    if command -v unzip >/dev/null 2>&1 && unzip -o -qq "$z" 'xray*' -d "$d" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v busybox >/dev/null 2>&1 && busybox unzip -o -q "$z" -d "$d" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1 && python3 -I -c 'import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+z.extractall(sys.argv[2], [n for n in z.namelist() if n.startswith("xray")])' "$z" "$d" >/dev/null 2>&1; then
+        return 0
+    fi
+    command -v bsdtar >/dev/null 2>&1 && bsdtar -xf "$z" -C "$d" >/dev/null 2>&1
+}
+
+xray_install_from() {
+    local src=$1 tmp b="" v f
+    local -a cand=()
+    tmp=$(mktemp -d)
+    if [ -d "$src" ]; then
+        mapfile -t cand < <(find "$src" -maxdepth 2 -type f \( -name xray -o -name xray_softfloat \) | sort)
+    elif [ "$(head -c 2 "$src" 2>/dev/null)" = "PK" ]; then
+        if ! xray_unzip "$src" "$tmp"; then
+            err "Could not extract the zip file (install unzip or python3)"
+            rm -rf "$tmp"
+            return 1
+        fi
+        cand=("$tmp/xray" "$tmp/xray_softfloat")
+    else
+        cand=("$src")
+    fi
+    for f in "${cand[@]}"; do
+        [ -f "$f" ] || continue
+        chmod +x "$f" 2>/dev/null
+        v=$("$f" version 2>/dev/null | awk 'NR == 1 {print $2}')
+        if is_ver "$v"; then
+            b=$f
+            break
+        fi
+    done
+    if [ -z "$b" ]; then
+        err "No working xray binary found (wrong architecture or broken file?)"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if mkdir -p "$XRAY_LIB" && install -m 755 "$b" "$XRAY_BIN.new" && mv -f "$XRAY_BIN.new" "$XRAY_BIN"; then
+        rm -rf "$tmp"
+        ok "Xray v$v installed to $XRAY_BIN"
+    else
+        rm -f "$XRAY_BIN.new"
+        rm -rf "$tmp"
+        err "Could not copy xray to $XRAY_LIB"
+        return 1
+    fi
+    if systemctl is-active --quiet "$XRAY_SVC" 2>/dev/null; then
+        systemctl restart "$XRAY_SVC" >/dev/null 2>&1 && ok "Xray exit service restarted"
+    fi
+    return 0
+}
+
+xray_menu() {
+    local arch src pre ver url path tmp det rc
+    while :; do
+        header "INSTALL / UPDATE XRAY"
+        if xray_installed; then kv "Installed version" "v$(xray_version)"; else kv "Installed version" "none"; fi
+        if ! arch=$(xray_arch); then
+            err "Unsupported architecture: $(uname -m)"
+            pause
+            return 1
+        fi
+        kv "Architecture" "linux-$arch"
+        info "Only the Kharej server of an Xray exit needs this"
+        choose src "Download source" 1 "GitHub" "Mirror" "Direct link" "Local file" "Back"
+        [ "$src" = 5 ] && return 0
+        tmp=$(mktemp -d)
+        path="$tmp/xray.zip"
+        url=""
+        case $src in
+            1 | 2)
+                pre=""
+                [ "$src" = 2 ] && pick_mirror pre
+                info "Checking the latest release ..."
+                det=$(xray_latest "$pre")
+                if [ -z "$det" ]; then
+                    warn "Could not detect the latest version"
+                    det=$XRAY_DEFAULT_VER
+                fi
+                ask ver "Version" "$det" is_ver "Use a version like $XRAY_DEFAULT_VER"
+                url="${pre}$XRAY_REPO/releases/download/v$ver/Xray-linux-$arch.zip"
+                download "$url" "$path" || path=""
+                ;;
+            3)
+                ask url "Download link to the .zip" "" is_url "Enter a valid http(s) URL"
+                download "$url" "$path" || path=""
+                ;;
+            4)
+                ask path "Path to zip, xray binary or folder" "" is_path "File or folder not found"
+                ;;
+        esac
+        if [ -n "$path" ] && [ -n "$url" ]; then
+            xray_sha_check "$path" "$url"
+            rc=$?
+            if ((rc == 0)); then
+                ok "SHA-256 checksum verified"
+            elif ((rc == 1)); then
+                err "SHA-256 checksum does not match, the file is broken or changed"
+                path=""
+            else
+                warn "Checksum file (.dgst) is not available"
+                confirm "Install without checksum check?" y || path=""
+            fi
+        fi
+        if [ -n "$path" ] && xray_install_from "$path"; then
+            rm -rf "$tmp"
+            pause
+            return 0
+        fi
+        rm -rf "$tmp"
+        confirm "Try another source?" y || return 1
+    done
+}
+
+gen_uuid() {
+    local u h
+    u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
+    if ! is_uuid "$u"; then
+        h=$(openssl rand -hex 16)
+        u="${h:0:8}-${h:8:4}-4${h:13:3}-a${h:17:3}-${h:20:12}"
+    fi
+    printf '%s' "$u"
+}
+
+meta_get() { sed -n "s/^$2=//p" "$TUN_DIR/$1/tunnel.conf" 2>/dev/null | head -n 1; }
+
+xray_groups_here() {
+    local n g
+    declare -A seen=()
+    while read -r n; do
+        [ -n "$n" ] || continue
+        [ "$(meta_get "$n" KIND)" = exit ] && [ "$(meta_get "$n" XMODE)" = xray ] && [ "$(meta_get "$n" SIDE)" = client ] || continue
+        g=$(meta_get "$n" GROUP)
+        [ -n "$g" ] && [ -z "${seen[$g]}" ] || continue
+        seen[$g]=1
+        printf '%s %s %s\n' "$g" "$(meta_get "$n" UUID)" "$(meta_get "$n" XPORT)"
+    done < <(tunnel_names)
+}
+
+xray_conf_gen() {
+    local g u p sep=""
+    printf '{\n  "log": {"loglevel": "warning"},\n  "inbounds": [\n'
+    while read -r g u p; do
+        [ -n "$g" ] || continue
+        printf '%s    {"tag": "%s-in", "listen": "127.0.0.1", "port": %s, "protocol": "vless", "settings": {"clients": [{"id": "%s"}], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "none"}}' "$sep" "$g" "$p" "$u"
+        sep=$',\n'
+    done < <(xray_groups_here)
+    printf '\n  ],\n  "outbounds": [\n'
+    printf '    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},\n'
+    printf '    {"tag": "block", "protocol": "blackhole"}\n  ],\n'
+    printf '  "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "ip": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"}]},\n'
+    printf '  "policy": {"levels": {"0": {"handshake": 8, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5}}}\n}\n'
+}
+
+xray_unit_write() {
+    cat >"$UNIT_DIR/$XRAY_SVC" <<EOU
+[Unit]
+Description=FRP Tunnel Xray exit
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$XRAY_BIN run -c $XRAY_CONF
+Restart=always
+RestartSec=3
+RestartPreventExitStatus=23
+LimitNOFILE=1048576
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+EOU
+}
+
+xray_sync() {
+    local tmp st
+    if [ -z "$(xray_groups_here)" ]; then
+        if [ -f "$UNIT_DIR/$XRAY_SVC" ]; then
+            systemctl disable --now "$XRAY_SVC" >/dev/null 2>&1
+            rm -f "$UNIT_DIR/$XRAY_SVC"
+            systemctl daemon-reload >/dev/null 2>&1
+        fi
+        rm -rf "${XRAY_DIR:?}"
+        return 0
+    fi
+    if ! xray_installed; then
+        err "Xray is not installed. Use Install / Update Xray first."
+        return 1
+    fi
+    mkdir -p "$XRAY_DIR"
+    chmod 700 "$XRAY_DIR"
+    tmp=$(mktemp --suffix=.json)
+    xray_conf_gen >"$tmp"
+    if ! "$XRAY_BIN" run -test -c "$tmp" >/dev/null 2>&1; then
+        err "Xray rejected the generated config"
+        "$XRAY_BIN" run -test -c "$tmp" 2>&1 | grep -m 3 -iE 'fail|error|invalid' | sed 's/^/    /'
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ -f "$XRAY_CONF" ] && cmp -s "$tmp" "$XRAY_CONF" && [ -f "$UNIT_DIR/$XRAY_SVC" ] && systemctl is-active --quiet "$XRAY_SVC" 2>/dev/null; then
+        rm -f "$tmp"
+        return 0
+    fi
+    install -m 600 "$tmp" "$XRAY_CONF"
+    rm -f "$tmp"
+    xray_unit_write
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable "$XRAY_SVC" >/dev/null 2>&1
+    systemctl restart "$XRAY_SVC" >/dev/null 2>&1
+    sleep 1
+    st=$(svc_state "$XRAY_SVC")
+    if [ "$st" = active ]; then
+        ok "Xray exit service is running"
+        return 0
+    fi
+    err "Xray exit service is $st"
+    journalctl -u "$XRAY_SVC" -n 6 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+    return 1
+}
+
+xui_py() {
+    python3 -I - "$@" <<'PY'
+import json
+import sqlite3
+import sys
+
+KEY = "xrayTemplateConfig"
+
+
+def db(path):
+    con = sqlite3.connect(path, timeout=20)
+    con.execute("PRAGMA busy_timeout=20000")
+    return con
+
+
+def patch(cfg, g, uuid, ports, url, iv):
+    pre = g + "-"
+    if (cfg.get("routing") or {}).get("script"):
+        sys.exit(4)
+    outs = [o for o in (cfg.get("outbounds") or []) if not str(o.get("tag", "")).startswith(pre)]
+    routing = cfg.get("routing") or {}
+    bals = [b for b in (routing.get("balancers") or []) if b.get("tag") != g]
+    rules = [r for r in (routing.get("rules") or []) if r.get("balancerTag") != g and r.get("ruleTag") != g]
+    if not ports:
+        rules = [r for r in rules if not str(r.get("outboundTag", "")).startswith(pre)]
+    for k in ("observatory", "burstObservatory"):
+        o = cfg.get(k)
+        if isinstance(o, dict) and isinstance(o.get("subjectSelector"), list):
+            o["subjectSelector"] = [s for s in o["subjectSelector"] if s != pre]
+            if not o["subjectSelector"]:
+                cfg.pop(k, None)
+    for name, port in ports:
+        outs.append({
+            "tag": pre + name,
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "127.0.0.1", "port": port, "users": [{"id": uuid, "encryption": "none", "flow": ""}]}]},
+            "streamSettings": {"network": "tcp", "security": "none"}
+        })
+    if len(ports) > 1:
+        k = "burstObservatory" if isinstance(cfg.get("burstObservatory"), dict) else "observatory"
+        o = cfg.get(k)
+        if not isinstance(o, dict):
+            o = {"subjectSelector": [], "probeURL": url, "probeInterval": iv, "enableConcurrency": True}
+        o.setdefault("subjectSelector", []).append(pre)
+        cfg[k] = o
+        bals.append({"tag": g, "selector": [pre], "strategy": {"type": "leastPing"}, "fallbackTag": pre + ports[0][0]})
+    api = [i for i, r in enumerate(rules) if r.get("outboundTag") == "api" and "api" in (r.get("inboundTag") or [])]
+    if api and api[0] != 0:
+        rules.insert(0, rules.pop(api[0]))
+    if len(ports) > 1:
+        rules.append({"type": "field", "ruleTag": g, "network": "tcp,udp", "balancerTag": g})
+    elif ports:
+        rules.append({"type": "field", "ruleTag": g, "network": "tcp,udp", "outboundTag": pre + ports[0][0]})
+    cfg["outbounds"] = outs
+    routing["rules"] = rules
+    if bals:
+        routing["balancers"] = bals
+    else:
+        routing.pop("balancers", None)
+    cfg["routing"] = routing
+    return cfg
+
+
+op = sys.argv[1]
+if op == "backup":
+    con = db(sys.argv[2])
+    dst = sqlite3.connect(sys.argv[3])
+    con.backup(dst)
+    dst.close()
+elif op == "get":
+    row = db(sys.argv[2]).execute("SELECT value FROM settings WHERE key=? ORDER BY id LIMIT 1", (KEY,)).fetchone()
+    val = row[0] if row and row[0] and row[0].strip() else sys.argv[4]
+    json.loads(val)
+    open(sys.argv[3], "w").write(val)
+elif op == "set":
+    val = open(sys.argv[3]).read()
+    json.loads(val)
+    con = db(sys.argv[2])
+    with con:
+        cur = con.execute("UPDATE settings SET value=? WHERE key=?", (val, KEY))
+        if cur.rowcount == 0:
+            con.execute("INSERT INTO settings(key, value) VALUES(?, ?)", (KEY, val))
+elif op == "patch":
+    cfg = json.load(open(sys.argv[2]))
+    ports = []
+    for p in filter(None, sys.argv[5].split(",")):
+        n, v = p.split(":")
+        ports.append((n, int(v)))
+    cfg = patch(cfg, sys.argv[4], sys.argv[6], ports, sys.argv[7], sys.argv[8])
+    json.dump(cfg, open(sys.argv[3], "w"), indent=2)
+elif op == "has":
+    cfg = json.load(open(sys.argv[2]))
+    pre = sys.argv[3] + "-"
+    sys.exit(0 if any(str(o.get("tag", "")).startswith(pre) for o in (cfg.get("outbounds") or [])) else 1)
+PY
+}
+
+xui_present() { [ -x /usr/local/x-ui/x-ui ] || systemctl cat x-ui.service >/dev/null 2>&1; }
+
+xui_env() {
+    local pid wd k v f
+    declare -A e=()
+    XUI_DB=""
+    XUI_XBIN=""
+    XUI_MAJOR=2
+    xui_present || return 1
+    pid=$(systemctl show -p MainPID --value x-ui.service 2>/dev/null)
+    if [ -n "$pid" ] && [ "$pid" != 0 ] && [ -r "/proc/$pid/environ" ]; then
+        while IFS= read -r -d '' f; do
+            k=${f%%=*}
+            v=${f#*=}
+            [[ $k == XUI_* ]] && e[$k]=$v
+        done <"/proc/$pid/environ"
+    fi
+    for f in /etc/default/x-ui /etc/sysconfig/x-ui /etc/conf.d/x-ui; do
+        [ -f "$f" ] || continue
+        while IFS='=' read -r k v; do
+            k=${k#export }
+            v=${v%\"}
+            v=${v#\"}
+            [[ $k == XUI_* ]] && [ -z "${e[$k]}" ] && e[$k]=$v
+        done <"$f"
+    done
+    [ "${e[XUI_DB_TYPE]}" = postgres ] && return 2
+    XUI_DB="${e[XUI_DB_FOLDER]:-/etc/x-ui}/x-ui.db"
+    [ -f "$XUI_DB" ] || return 1
+    wd=$(systemctl show -p WorkingDirectory --value x-ui.service 2>/dev/null)
+    [ -n "$wd" ] || wd=/usr/local/x-ui
+    v=${e[XUI_BIN_FOLDER]:-bin}
+    [[ $v == /* ]] || v="$wd/$v"
+    XUI_XBIN=$(find "$v" -maxdepth 1 -type f -name 'xray-linux-*' 2>/dev/null | head -n 1)
+    v=$(/usr/local/x-ui/x-ui -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    [ -n "$v" ] && XUI_MAJOR=${v%%.*}
+    command -v python3 >/dev/null 2>&1 || return 3
+    return 0
+}
+
+xui_default() {
+    if ((XUI_MAJOR >= 3)); then printf '%s' "$XUI_DEF3"; else printf '%s' "$XUI_DEF2"; fi
+}
+
+xui_update() {
+    local g=$1 ports=$2 uuid=$3 d tpl new run rc bk
+    d=$(mktemp -d)
+    tpl="$d/tpl.json"
+    new="$d/new.json"
+    mkdir -p "$BACKUP_DIR"
+    bk="$BACKUP_DIR/x-ui-$(date +%Y%m%d-%H%M%S).db"
+    if ! xui_py backup "$XUI_DB" "$bk" 2>/dev/null; then
+        err "Could not back up the 3x-ui database"
+        rm -rf "$d"
+        return 1
+    fi
+    if ! xui_py get "$XUI_DB" "$tpl" "$(xui_default)" 2>/dev/null; then
+        err "Could not read the Xray template from the 3x-ui database"
+        rm -rf "$d"
+        return 1
+    fi
+    xui_py patch "$tpl" "$new" "$g" "$ports" "$uuid" "$XPROBE_URL" "$XPROBE_INT" 2>/dev/null
+    rc=$?
+    if ((rc == 4)); then
+        err "The panel uses a routing script, so routing rules cannot be added automatically"
+        rm -rf "$d"
+        return 1
+    elif ((rc != 0)); then
+        err "Could not update the Xray template"
+        rm -rf "$d"
+        return 1
+    fi
+    if [ -n "$XUI_XBIN" ]; then
+        run="${XUI_XBIN%/*}/config.json"
+        if [ -f "$run" ]; then
+            xui_py patch "$run" "$d/run.json" "$g" "$ports" "$uuid" "$XPROBE_URL" "$XPROBE_INT" 2>/dev/null || cp "$new" "$d/run.json"
+        else
+            cp "$new" "$d/run.json"
+        fi
+        if ! (cd "${XUI_XBIN%/*}" && "$XUI_XBIN" run -test -c "$d/run.json" >/dev/null 2>&1); then
+            err "The panel's Xray rejected the new config, nothing was changed"
+            (cd "${XUI_XBIN%/*}" && "$XUI_XBIN" run -test -c "$d/run.json" 2>&1) | grep -m 3 -iE 'fail|error|invalid' | sed 's/^/    /'
+            rm -rf "$d"
+            return 1
+        fi
+    fi
+    if ! xui_py set "$XUI_DB" "$new" 2>/dev/null; then
+        err "Could not write the 3x-ui database"
+        rm -rf "$d"
+        return 1
+    fi
+    rm -rf "$d"
+    systemctl reload x-ui.service >/dev/null 2>&1 || systemctl restart x-ui.service >/dev/null 2>&1
+    sleep 2
+    ok "3x-ui updated and Xray reloaded (backup: $bk)"
+    return 0
+}
+
+xui_has() {
+    local g=$1 d rc
+    xui_env || return 1
+    d=$(mktemp -d)
+    xui_py get "$XUI_DB" "$d/t.json" "$(xui_default)" 2>/dev/null && xui_py has "$d/t.json" "$g" 2>/dev/null
+    rc=$?
+    rm -rf "$d"
+    return $rc
+}
+
+is_xexit() { [ "${T[KIND]}" = exit ] && [ "${T[XMODE]}" = xray ]; }
+
+is_group_name() { [[ $1 =~ ^[a-z][a-z0-9]{0,6}$ ]]; }
+
+is_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
+
+proto_sfx() { if [ "$1" = websocket ]; then printf 'ws'; else printf '%s' "$1"; fi; }
+
+xg_members() {
+    local g=$1 n p
+    for p in tcp kcp quic websocket; do
+        while read -r n; do
+            [ -n "$n" ] || continue
+            [ "$(meta_get "$n" GROUP)" = "$g" ] && [ "$(meta_get "$n" PROTO)" = "$p" ] && [ "$(meta_get "$n" XMODE)" = xray ] && printf '%s\n' "$n"
+        done < <(tunnel_names)
+    done
+}
+
+xg_names() {
+    local n g
+    declare -A seen=()
+    while read -r n; do
+        [ -n "$n" ] || continue
+        [ "$(meta_get "$n" XMODE)" = xray ] || continue
+        g=$(meta_get "$n" GROUP)
+        [ -n "$g" ] && [ -z "${seen[$g]}" ] || continue
+        seen[$g]=1
+        printf '%s\n' "$g"
+    done < <(tunnel_names)
+}
+
+xg_taken() {
+    local p
+    [ -n "$(xg_members "$1")" ] && return 0
+    for p in tcp kcp quic ws; do
+        [ -e "$TUN_DIR/$1-$p" ] && return 0
+    done
+    return 1
+}
+
+v_new_group() {
+    is_group_name "$1" || {
+        err "Use 1-7 characters: a-z and 0-9, starting with a letter"
+        return 1
+    }
+    if xg_taken "$1"; then
+        err "Exit '$1' already exists"
+        return 1
+    fi
+    return 0
+}
+
+next_group() {
+    local i=1
+    while xg_taken "exit$i"; do i=$((i + 1)); done
+    printf 'exit%s' "$i"
+}
+
+xg_ports_arg() {
+    local n out="" sep=""
+    for n in $(xg_members "$1"); do
+        [[ " $2 " == *" $n "* ]] && continue
+        out+="$sep$(proto_sfx "$(meta_get "$n" PROTO)"):$(meta_get "$n" PORTS)"
+        sep=","
+    done
+    printf '%s' "$out"
+}
+
+v_protos() {
+    local x plist=" "
+    local -a a
+    IFS=, read -ra a <<<"${1//[[:space:]]/}"
+    if ((${#a[@]} < 1 || ${#a[@]} > 4)); then
+        err "Pick 1 to 4 of: tcp, kcp, quic, websocket"
+        return 1
+    fi
+    for x in "${a[@]}"; do
+        [ "$x" = ws ] && x=websocket
+        if [[ ! $x =~ ^(tcp|kcp|quic|websocket)$ ]]; then
+            err "Unknown protocol: ${x:-empty}"
+            return 1
+        fi
+        if [[ $plist == *" $x "* ]]; then
+            err "Protocol listed twice: $x"
+            return 1
+        fi
+        plist+="$x "
+    done
+    read -ra GPROTOS <<<"$plist"
+    return 0
+}
+
+free_run() {
+    local p=$1 n=$2 i ok
+    scan_listen t
+    while ((p + n - 1 <= 65000)); do
+        ok=1
+        for ((i = 0; i < n; i++)); do
+            if [ -n "${LMAP[$((p + i))]}" ] || [ -n "${OTHERS[$((p + i))/tcp]}" ] || [[ " $3 " == *" $((p + i)) "* ]]; then
+                ok=0
+                p=$((p + i + 1))
+                break
+            fi
+        done
+        if [ "$ok" = 1 ]; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+v_panel_base() {
+    local i p o
+    is_port "$1" || {
+        err "Port must be between 1 and 65535"
+        return 1
+    }
+    if (($1 + ${#GPROTOS[@]} - 1 > 65535)); then
+        err "Not enough ports after $1"
+        return 1
+    fi
+    if r443_present && (($1 <= R443_MAX && $1 + ${#GPROTOS[@]} - 1 >= R443_MIN)); then
+        err "reality443 uses ports $R443_MIN-$R443_MAX for its inbounds. Pick a port outside this range."
+        return 1
+    fi
+    load_others
+    for ((i = 0; i < ${#GPROTOS[@]}; i++)); do
+        p=$(($1 + i))
+        if [ -n "${OTHERS[$p/tcp]}" ]; then
+            err "Port $p belongs to tunnel ${OTHERS[$p/tcp]}"
+            return 1
+        fi
+        if o=$(port_owner "$p" tcp); then
+            err "Port $p is already used by $o"
+            return 1
+        fi
+    done
+    return 0
+}
+
+alloc_tunnel_port() {
+    local p=$1 x
+    while :; do
+        x=$(alloc_port "$p" "$3") || return 1
+        if [[ $2 == kcp || $2 == quic ]]; then
+            scan_listen u
+            if [ -n "${LMAP[$x]}" ]; then
+                p=$((x + 1))
+                continue
+            fi
+        fi
+        printf '%s' "$x"
+        return 0
+    done
+}
+
+xgroup_key_make() {
+    local g=$1 n first
+    first=$(xg_members "$g" | head -n 1)
+    {
+        printf 'V=1\nGROUP=%s\nUUID=%s\n' "$g" "$(meta_get "$first" UUID)"
+        for n in $(xg_members "$g"); do
+            tunnel_load "$n" || continue
+            printf -- '---\n'
+            key_lines
+        done
+    } | gzip -9c | base64 -w0 | sed "s/^/$GKEY_PREFIX/"
+}
+
+xgroup_key_parse() {
+    local data line k n=-1 i
+    declare -A pseen=()
+    GH=()
+    GSEC=()
+    [[ $1 == "$GKEY_PREFIX"* ]] || return 1
+    data=$(key_decode "$1" "$GKEY_PREFIX") || return 1
+    while IFS= read -r line; do
+        if [ "$line" = "---" ]; then
+            n=$((n + 1))
+            GSEC[n]=""
+            continue
+        fi
+        if ((n < 0)); then
+            k=${line%%=*}
+            [[ $k =~ ^[A-Z_]+$ ]] && GH[$k]=${line#*=}
+        else
+            GSEC[n]+="$line"$'\n'
+        fi
+    done <<<"$data"
+    [ "${GH[V]}" = 1 ] && is_group_name "${GH[GROUP]}" && is_uuid "${GH[UUID]}" || return 1
+    ((${#GSEC[@]} >= 1 && ${#GSEC[@]} <= 4)) || return 1
+    for ((i = 0; i < ${#GSEC[@]}; i++)); do
+        key_load "${GSEC[i]}"
+        key_valid || return 1
+        [ "${K[ROLE]}" = iran ] && [ "${K[MODE]}" = reverse ] && [ "${K[KIND]}" = exit ] && [ "${K[XMODE]}" = xray ] || return 1
+        [[ ${K[PROTO]} =~ ^(tcp|kcp|quic|websocket)$ ]] && [ -z "${pseen[${K[PROTO]}]}" ] || return 1
+        pseen[${K[PROTO]}]=1
+    done
+    return 0
+}
+
+xgroup_key_show() {
+    local g=$1 k f
+    k=$(xgroup_key_make "$g")
+    [ -n "$k" ] || return 1
+    mkdir -p "$XEXIT_DIR"
+    chmod 700 "$XEXIT_DIR"
+    f="$XEXIT_DIR/$g.key"
+    printf '%s\n' "$k" >"$f"
+    chmod 600 "$f"
+    section "Connection key for the Kharej server"
+    cnext
+    printf '\n\e[38;5;%sm%s\e[0m\n\n' "$NC" "$k"
+    info "On the Kharej server: Create tunnel, Kharej, then paste this key"
+    info "Saved to $f"
+    warn "Keep this key private. It contains the tunnel token and the Xray user ID."
+}
+
 v_new_name() {
     is_name "$1" || {
         err "Use 1-12 characters: a-z, 0-9, -"
+        return 1
+    }
+    [[ $1 == tunnel-* || $1 == lip-* || $1 == *-wss || $1 == *-provider ]] && {
+        err "Names starting with tunnel- or lip-, or ending with -wss or -provider, are reserved"
         return 1
     }
     [ -e "$TUN_DIR/$1" ] && {
@@ -2198,6 +2978,7 @@ others_ports() {
                 for p in "${PORT_LIST[@]}"; do printf '%s/%s %s\n' "$p" "$t" "${T[NAME]}"; done
             done
         fi
+        [ -n "${T[XPORT]}" ] && printf '%s/tcp %s\n' "${T[XPORT]}" "${T[NAME]}"
     done
 }
 
@@ -2639,6 +3420,12 @@ tunnel_summary() {
     [ -n "${T[LIP]}" ] && kv "Local IP link" "${T[LIP]}"
     kv "Tunnel token" "${T[TOKEN]}"
     kv "TLS" "$(tls_label)"
+    if is_xexit; then
+        kv "Tunnel type" "Xray exit '${T[GROUP]}', traffic leaves from Kharej"
+        if [ "${T[SIDE]}" = server ]; then kv "Panel port" "127.0.0.1:${T[PORTS]}"; else kv "Xray port" "127.0.0.1:${T[XPORT]}"; fi
+        kv "Advanced" "$(adv_label)"
+        return
+    fi
     if is_exit; then
         kv "Tunnel type" "Exit for the Iran panel, traffic leaves from Kharej"
         [ "${T[SIDE]}" = server ] && kv "Panel SOCKS" "127.0.0.1:${T[PORTS]}  ${T[SOCKS_USER]} / ${T[SOCKS_PASS]}"
@@ -2671,6 +3458,10 @@ tunnel_create() {
     step_role
     blank
     if key_prompt; then
+        if [ "$GKEY" = y ]; then
+            xexit_import
+            return
+        fi
         fk=y
         key_apply
         ok "Key accepted: $(mode_label)"
@@ -2799,6 +3590,7 @@ exit_create() {
     T[MODE]=reverse
     derive_side
     T[KIND]="exit"
+    T[XMODE]=socks
     T[PROTO]=tcp
     T[TLS]=y
     T[CERT_MODE]=builtin
@@ -2847,6 +3639,18 @@ exit_create() {
     pause
 }
 
+exit_port_label() { if is_xexit; then printf 'Panel port'; else printf 'Panel SOCKS port'; fi; }
+
+mode_short() {
+    if is_xexit; then
+        printf 'xray'
+    elif is_exit; then
+        printf 'socks'
+    else
+        printf '%s' "${T[MODE]}"
+    fi
+}
+
 tunnel_table() {
     local i n st en
     mapfile -t TNAMES < <(tunnel_names)
@@ -2863,7 +3667,7 @@ tunnel_table() {
         en=$(svc_enabled "frp-$n.service")
         cnext
         printf '  \e[38;5;%sm%-3s %-12s %-8s %-8s %-9s %-14s\e[0m \e[38;5;%sm%-9s\e[0m\e[38;5;%sm%s\e[0m\n' \
-            "$NC" "$((i + 1))" "$n" "$(side_role "${T[ROLE]}")" "$(is_exit && echo exit || echo "${T[MODE]}")" "${T[PROTO]}" "$(trunc "${T[PORTS]}" 14)" \
+            "$NC" "$((i + 1))" "$n" "$(side_role "${T[ROLE]}")" "$(mode_short)" "${T[PROTO]}" "$(trunc "${T[PORTS]}" 14)" \
             "$(state_color "$st")" "$st" "$(state_color "$en")" "$en"
     done
     return 0
@@ -2909,7 +3713,16 @@ tunnel_details() {
         printf '  \e[38;5;%sm%-20s\e[0m \e[38;5;%sm%s\e[0m \e[38;5;%sm/ %s\e[0m\n' "$NC" "$u" "$(state_color "$st")" "$st" "$NC" "$(svc_enabled "$u")"
     done
     kv "Admin API" "http://127.0.0.1:${T[ADMIN_PORT]}  ${T[ADMIN_USER]} / ${T[ADMIN_PASS]}"
-    is_exit && [ "${T[SIDE]}" = server ] && exit_panel_guide
+    if is_xexit; then
+        kv "Exit tunnels" "$(xg_label "${T[GROUP]}")"
+        if [ "${T[SIDE]}" = server ]; then
+            if xui_has "${T[GROUP]}"; then kv "3x-ui" "this exit is in the panel settings"; else kv "3x-ui" "not added, see Exit tunnel menu"; fi
+        else
+            kv "Xray service" "$(svc_state "$XRAY_SVC")"
+        fi
+    elif is_exit && [ "${T[SIDE]}" = server ]; then
+        exit_panel_guide
+    fi
     kv "Created" "${T[CREATED]}"
     cert_paths
     if [ "${T[CERT_MODE]}" = self ] || [ "${T[CERT_MODE]}" = le ]; then
@@ -2952,7 +3765,9 @@ tunnel_edit() {
     while :; do
         header "EDIT: $n"
         item 1 "Tunnel port & IP     $(endpoint_label)"
-        if is_exit; then
+        if is_xexit; then
+            item 2 "Panel port           ${T[PORTS]}"
+        elif is_exit; then
             item 2 "Panel SOCKS port     ${T[PORTS]}"
         else
             item 2 "VPN config ports     ${T[PORTS]} ${T[PTYPE]}"
@@ -2979,7 +3794,7 @@ tunnel_edit() {
                 ;;
             3)
                 old=${T[PROTO]}
-                step_proto
+                is_xexit || step_proto
                 if [ "$old" != "${T[PROTO]}" ]; then
                     [ "${T[SIDE]}" = server ] && step_endpoint
                     [ "${T[PROTO]}" = wss ] || T[INT_PORT]=""
@@ -2995,9 +3810,14 @@ tunnel_edit() {
             4)
                 if tunnel_apply; then
                     ok "Tunnel '$n' updated"
+                    if is_xexit && [ "${T[SIDE]}" = client ]; then
+                        xray_sync
+                    elif is_xexit && xui_has "${T[GROUP]}" && confirm "Update 3x-ui with this change?" y; then
+                        xui_update "${T[GROUP]}" "$(xg_ports_arg "${T[GROUP]}")" "${T[UUID]}"
+                    fi
                     warn "Make the same change on the $(other_role) server with Edit, or delete the tunnel there and create it again with this key"
                     key_show
-                    is_exit && [ "${T[SIDE]}" = server ] && exit_panel_guide
+                    is_exit && ! is_xexit && [ "${T[SIDE]}" = server ] && exit_panel_guide
                 fi
                 pause
                 return
@@ -3012,6 +3832,11 @@ tunnel_delete() {
     header "DELETE TUNNEL"
     pick_tunnel n || return
     tunnel_load "$n"
+    if is_xexit; then
+        xexit_delete "$n"
+        pause
+        return
+    fi
     m=${T[CERT_MODE]}
     r=${T[CERT_REF]}
     if confirm "Delete tunnel '$n'?" n; then
@@ -3053,11 +3878,15 @@ svc_menu() {
     done
 }
 
+xlog_units() { [ "$(meta_get "$1" XMODE):$(meta_get "$1" SIDE)" = xray:client ] && printf '%s\n' -u "$XRAY_SVC"; }
+
 live_log() {
+    local -a xu=()
+    mapfile -t xu < <(xlog_units "$1")
     info "Press Ctrl+C to stop"
     blank
     trap ':' INT
-    journalctl -f -n 50 -o short-iso -u "frp-$1.service" -u "frp-$1-provider.service" -u "frp-$1-wss.service"
+    journalctl -f -n 50 -o short-iso -u "frp-$1.service" -u "frp-$1-provider.service" -u "frp-$1-wss.service" "${xu[@]}"
     trap on_int INT
 }
 
@@ -3180,10 +4009,10 @@ tunnel_diagnose() {
                 done
             done
             if is_exit && [ -n "$miss" ]; then
-                err "Panel SOCKS port ${T[PORTS]} is not open yet"
+                err "$(exit_port_label) ${T[PORTS]} is not open yet"
                 diag_fix "Run Diagnose on the Kharej server, it shows the reason from its side"
             elif is_exit; then
-                ok "Panel SOCKS port ${T[PORTS]} is open on 127.0.0.1"
+                ok "$(exit_port_label) ${T[PORTS]} is open on 127.0.0.1"
             elif [ -n "$miss" ]; then
                 err "VPN config ports not open yet: $(short_list "$miss")"
                 diag_fix "Make sure the same VPN config ports are set on both servers"
@@ -3192,7 +4021,11 @@ tunnel_diagnose() {
             fi
         fi
     fi
-    if is_exit && [ "${T[SIDE]}" = server ] && [ "${cc:-0}" -gt 0 ]; then
+    if is_xexit && [ "${T[SIDE]}" = server ]; then
+        xexit_diag_server "${cc:-0}"
+    elif is_xexit; then
+        xexit_diag_client
+    elif is_exit && [ "${T[SIDE]}" = server ] && [ "${cc:-0}" -gt 0 ]; then
         p=$(curl -s -m 12 --socks5-hostname "${T[SOCKS_USER]}:${T[SOCKS_PASS]}@127.0.0.1:${T[PORTS]}" "$EXIT_TEST_URL" 2>/dev/null | head -c 60)
         if is_ip "$p"; then
             ok "The exit works, traffic leaves from Kharej IP $p"
@@ -3203,7 +4036,10 @@ tunnel_diagnose() {
             diag_fix "Run Diagnose on the Kharej server, and check that the Kharej server has internet access"
         fi
     fi
-    if grep -q 'connect to local service' <<<"$log"; then
+    if is_xexit && grep -q 'connect to local service' <<<"$log"; then
+        warn "Xray on this server did not answer the tunnel recently"
+        diag_fix "Check the Xray exit service in Logs & diagnose"
+    elif grep -q 'connect to local service' <<<"$log"; then
         warn "Nothing answered on a VPN config port of this server recently"
         diag_fix "Check that your VPN inbound runs on this server with the same port"
     fi
@@ -3218,6 +4054,7 @@ tunnel_diagnose() {
 
 logs_menu() {
     local n c
+    local -a xu=()
     header "LOGS & DIAGNOSE"
     pick_tunnel n || return
     while :; do
@@ -3241,10 +4078,12 @@ logs_menu() {
                 for c in provider wss; do
                     [ -f "$UNIT_DIR/frp-$n-$c.service" ] && blank && systemctl status "frp-$n-$c.service" --no-pager -l 2>&1 | head -n 12
                 done
+                [ -n "$(xlog_units "$n")" ] && blank && systemctl status "$XRAY_SVC" --no-pager -l 2>&1 | head -n 12
                 pause
                 ;;
             4)
-                journalctl -n 100 --no-pager -o short-iso -u "frp-$n.service" -u "frp-$n-provider.service" -u "frp-$n-wss.service" 2>&1
+                mapfile -t xu < <(xlog_units "$n")
+                journalctl -n 100 --no-pager -o short-iso -u "frp-$n.service" -u "frp-$n-provider.service" -u "frp-$n-wss.service" "${xu[@]}" 2>&1
                 pause
                 ;;
             5)
@@ -3254,6 +4093,476 @@ logs_menu() {
             0) return ;;
         esac
     done
+}
+
+xg_label() {
+    local n out="" sep=""
+    for n in $(xg_members "$1"); do
+        out+="$sep$(meta_get "$n" PROTO)"
+        sep=", "
+    done
+    printf '%s' "$out"
+}
+
+xexit_guide() {
+    local g=$1 n uuid first k=1 multi=n
+    first=$(xg_members "$g" | head -n 1)
+    uuid=$(meta_get "$first" UUID)
+    [ "$(xg_members "$g" | wc -l)" -gt 1 ] && multi=y
+    section "Iran panel setup by hand (3x-ui)"
+    say "$k. Outbounds > Add Outbound > JSON tab. Paste each line as its own outbound:"
+    for n in $(xg_members "$g"); do
+        cnext
+        printf '     \e[38;5;%sm{"tag": "%s-%s", "protocol": "vless", "settings": {"address": "127.0.0.1", "port": %s, "id": "%s", "flow": "", "encryption": "none"}, "streamSettings": {"network": "tcp", "security": "none"}}\e[0m\n' \
+            "$NC" "$g" "$(proto_sfx "$(meta_get "$n" PROTO)")" "$(meta_get "$n" PORTS)" "$uuid"
+    done
+    k=$((k + 1))
+    if [ "$multi" = y ]; then
+        say "$k. Balancers > Add Balancer: Tag $g, Strategy Least Ping, Selector $g-, Fallback $g-$(proto_sfx "$(meta_get "$first" PROTO)")"
+        k=$((k + 1))
+        say "$k. Routing Rules > Add Rule: Network TCP,UDP, Balancer Tag $g. Keep this rule at the bottom"
+    else
+        say "$k. Routing Rules > Add Rule: Network TCP,UDP, Outbound Tag $g-$(proto_sfx "$(meta_get "$first" PROTO)"). Keep this rule at the bottom"
+    fi
+    k=$((k + 1))
+    say "$k. Save, then Restart Xray"
+    info "Rules added later in the panel must stay above this rule, or they will not be used"
+}
+
+xexit_wait() {
+    local g=$1 n on total i a
+    info "Now paste the key on the Kharej server. Waiting for it to connect, press Enter to stop waiting."
+    for ((i = 0; i < 200; i++)); do
+        on=0
+        total=0
+        for n in $(xg_members "$g"); do
+            total=$((total + 1))
+            a=$(curl -s -m 3 -u "$(meta_get "$n" ADMIN_USER):$(meta_get "$n" ADMIN_PASS)" "http://127.0.0.1:$(meta_get "$n" ADMIN_PORT)/api/proxy/tcp" 2>/dev/null)
+            grep -q '"status":"online"' <<<"$a" && on=$((on + 1))
+        done
+        if ((on > 0)); then
+            printf '\r\e[K'
+            ok "Kharej is connected: $on of $total tunnel(s) online"
+            ((on < total)) && warn "Some protocols are not connected yet. The panel uses the ones that work."
+            return 0
+        fi
+        printf '\r  \e[38;5;%sm  waiting %ss ...\e[0m' "$C_SUB" "$((i * 3))"
+        if IFS= read -r -t 3; then
+            printf '\r\e[K'
+            return 1
+        fi
+    done
+    printf '\r\e[K'
+    warn "Kharej did not connect within 10 minutes"
+    return 1
+}
+
+xexit_panel() {
+    local g=$1 rc
+    xui_env
+    rc=$?
+    if ((rc == 2)); then
+        warn "3x-ui uses PostgreSQL here, so the outbound must be added by hand"
+    elif ((rc == 3)); then
+        warn "python3 is needed to edit the 3x-ui settings, so the outbound must be added by hand"
+    elif ((rc == 0)); then
+        info "3x-ui was found on this server"
+        info "Close the Xray Configs page in your browser first, or saving it later will undo this change"
+        if confirm "Add the Kharej exit to 3x-ui now?" y; then
+            xui_update "$g" "$(xg_ports_arg "$g")" "$(meta_get "$(xg_members "$g" | head -n 1)" UUID)" && return 0
+        fi
+    fi
+    xexit_guide "$g"
+    return 1
+}
+
+xexit_create() {
+    local g c k list ip p tp base i n ex="" uuid adv=n
+    local -a names=() tports=()
+    need_frp || return
+    header "XRAY EXIT (USERS ON IRAN)"
+    info "Run this on the Iran server. Users stay on the Iran panel and their traffic leaves from Kharej."
+    info "On the Kharej server this script installs Xray by itself. No panel is needed there."
+    T=()
+    K=()
+    EXCL=()
+    GPROTOS=()
+    blank
+    ask g "Exit name" "$(next_group)" v_new_group "-"
+    choose c "Tunnel protocols" 1 "tcp + kcp + quic, use the best one automatically" "tcp only" "Choose myself"
+    case $c in
+        1) GPROTOS=(tcp kcp quic) ;;
+        2) GPROTOS=(tcp) ;;
+        3) ask list "Protocols, comma separated: tcp, kcp, quic, websocket" "tcp,kcp,quic" v_protos "-" ;;
+    esac
+    T[ROLE]=iran
+    T[MODE]=reverse
+    derive_side
+    T[KIND]="exit"
+    T[XMODE]=xray
+    T[GROUP]=$g
+    T[NAME]="$g-$(proto_sfx "${GPROTOS[0]}")"
+    T[PROTO]=${GPROTOS[0]}
+    T[TLS]=y
+    T[CERT_MODE]=builtin
+    T[LISTEN]=local
+    T[PTYPE]=tcp
+    section "Connection"
+    get_public_ip && ip=$PUBIP
+    ask "T[PUB_ADDR]" "Iran IP" "$ip" is_host "Enter a valid IP or domain"
+    CHK_PROTOS="tcp udp"
+    tp=$(alloc_tunnel_port 7000 "${GPROTOS[0]}" "")
+    ask p "First tunnel port" "$tp" v_bind_port "-"
+    if confirm "Advanced settings?" n; then
+        adv=y
+        section "Advanced"
+        step_token
+        T[CERT_REF]=$g
+        if ! step_advanced; then
+            err "TLS setup failed, the exit was not created"
+            pause
+            return
+        fi
+    else
+        T[TOKEN]=$(rand_str 32)
+    fi
+    tunnel_defaults
+    T[LISTEN]=local
+    T[PTYPE]=tcp
+    ex=" $p "
+    tports=("$p")
+    for ((i = 1; i < ${#GPROTOS[@]}; i++)); do
+        tp=$(alloc_tunnel_port "$((tports[i - 1] + 1))" "${GPROTOS[i]}" "$ex") || {
+            err "No free tunnel port found"
+            pause
+            return
+        }
+        tports+=("$tp")
+        ex+="$tp "
+    done
+    load_others
+    base=$(free_run 20900 "${#GPROTOS[@]}" "$ex")
+    for ((i = 0; i < ${#GPROTOS[@]}; i++)); do ex+="$((base + i)) "; done
+    if [ "$adv" = y ]; then
+        section "Panel ports"
+        ask base "First panel port on 127.0.0.1" "$base" v_panel_base "-"
+        for ((i = 0; i < ${#GPROTOS[@]}; i++)); do ex+="$((base + i)) "; done
+    fi
+    uuid=$(gen_uuid)
+    section "Summary"
+    kv "Exit name" "$g"
+    kv "This server" "Iran, users connect here"
+    kv "Iran IP" "${T[PUB_ADDR]}"
+    kv "Tunnel token" "${T[TOKEN]}"
+    kv "TLS" "$(tls_label)"
+    for ((i = 0; i < ${#GPROTOS[@]}; i++)); do
+        kv "${GPROTOS[i]}" "tunnel port ${tports[i]}, panel port 127.0.0.1:$((base + i))"
+    done
+    kv "Xray user ID" "$uuid"
+    ((${#GPROTOS[@]} > 1)) && kv "Switching" "the panel picks the fastest working tunnel every 30s"
+    blank
+    if ! confirm "Create this exit?" y; then
+        warn "Cancelled"
+        pause
+        return
+    fi
+    blank
+    declare -A base_t=()
+    for k in "${!T[@]}"; do base_t[$k]=${T[$k]}; done
+    EXTRA_EXCL=$ex
+    for ((i = 0; i < ${#GPROTOS[@]}; i++)); do
+        T=()
+        for k in "${!base_t[@]}"; do T[$k]=${base_t[$k]}; done
+        n="$g-$(proto_sfx "${GPROTOS[i]}")"
+        T[NAME]=$n
+        T[PFX]=$n
+        T[PROTO]=${GPROTOS[i]}
+        T[BIND_PORT]=${tports[i]}
+        T[PORTS]=$((base + i))
+        T[UUID]=$uuid
+        T[XPORT]=""
+        [ "${T[CERT_MODE]}" = self ] || T[CERT_REF]=""
+        section "Tunnel $n"
+        if ! tunnel_apply; then
+            err "Tunnel $n was saved but its service did not start. Use Edit to fix it."
+        fi
+        names+=("$n")
+    done
+    EXTRA_EXCL=""
+    blank
+    ok "Xray exit '$g' created with ${#names[@]} tunnel(s)"
+    xgroup_key_show "$g"
+    if xexit_wait "$g"; then
+        xexit_panel "$g"
+    else
+        info "When Kharej is connected, add the exit to the panel with: Exit tunnel > Add an Xray exit to 3x-ui"
+        xexit_guide "$g"
+    fi
+    pause
+}
+
+xexit_import() {
+    local g i n xp m
+    local -a made=()
+    g=${GH[GROUP]}
+    section "Xray exit '$g' from the Iran server"
+    kv "Tunnels" "${#GSEC[@]}"
+    if ! need_xray; then
+        err "Xray is needed on this server for an Xray exit"
+        pause
+        return
+    fi
+    if xg_taken "$g"; then
+        if [ "$(meta_get "$(xg_members "$g" | head -n 1)" UUID)" = "${GH[UUID]}" ] && confirm "Exit '$g' already exists here. Replace it with this key?" y; then
+            for m in $(xg_members "$g"); do tunnel_remove "$m"; done
+        else
+            ask g "Name for this exit on this server" "$(next_group)" v_new_group "-"
+        fi
+    fi
+    xp=$(alloc_port 30800 "") || {
+        err "No free local port for Xray"
+        pause
+        return
+    }
+    for ((i = 0; i < ${#GSEC[@]}; i++)); do
+        T=()
+        K=()
+        key_load "${GSEC[i]}"
+        key_apply
+        n="$g-$(proto_sfx "${T[PROTO]}")"
+        T[NAME]=$n
+        T[GROUP]=$g
+        T[UUID]=${GH[UUID]}
+        T[XPORT]=$xp
+        T[LISTEN]=local
+        T[PTYPE]=tcp
+        T[LIP]=""
+        section "Tunnel $n (${T[PROTO]})"
+        if [ "${T[CERT_MODE]}" = self ] && ! key_write_certs; then
+            err "Tunnel $n was skipped"
+            continue
+        fi
+        if tunnel_apply; then
+            made+=("$n")
+        else
+            err "Tunnel $n was saved but its service did not start"
+        fi
+    done
+    blank
+    if ! xray_sync; then
+        err "The tunnels are ready, but Xray did not start. Check Logs & diagnose."
+        pause
+        return
+    fi
+    ok "Xray exit '$g' is ready: ${#made[@]} of ${#GSEC[@]} tunnel(s) running"
+    info "Xray listens on 127.0.0.1:$xp, traffic of the Iran panel leaves from this server"
+    info "Go back to the Iran server. It finishes the panel setup when it sees this server."
+    net_offer
+    pause
+}
+
+xg_pick() {
+    local __n=$1 c
+    local -a gs=()
+    mapfile -t gs < <(xg_names)
+    if ((${#gs[@]} == 0)); then
+        warn "No Xray exit on this server"
+        return 1
+    fi
+    if ((${#gs[@]} == 1)); then
+        printf -v "$__n" '%s' "${gs[0]}"
+        return 0
+    fi
+    local -a lbl=()
+    for c in "${gs[@]}"; do lbl+=("$c  ($(xg_label "$c"))"); done
+    choose c "Xray exit" 1 "${lbl[@]}"
+    printf -v "$__n" '%s' "${gs[c - 1]}"
+}
+
+xexit_panel_menu() {
+    local g op=$1 rc
+    header "3X-UI: XRAY EXIT"
+    xg_pick g || {
+        pause
+        return
+    }
+    if [ "$(meta_get "$(xg_members "$g" | head -n 1)" SIDE)" != server ]; then
+        warn "This is the Kharej side. The panel is on the Iran server."
+        pause
+        return
+    fi
+    if [ "$op" = guide ]; then
+        xexit_guide "$g"
+        pause
+        return
+    fi
+    xui_env
+    rc=$?
+    if ((rc != 0)); then
+        warn "3x-ui with an SQLite database and python3 was not found on this server"
+        [ "$op" = add ] && xexit_guide "$g"
+        pause
+        return
+    fi
+    if [ "$op" = add ]; then
+        info "Close the Xray Configs page in your browser first, or saving it later will undo this change"
+        confirm "Add exit '$g' to 3x-ui now?" y && xui_update "$g" "$(xg_ports_arg "$g")" "$(meta_get "$(xg_members "$g" | head -n 1)" UUID)"
+    else
+        confirm "Remove exit '$g' from 3x-ui? Users will go out directly from Iran again." y && xui_update "$g" "" ""
+    fi
+    pause
+}
+
+exit_menu() {
+    local c
+    while :; do
+        header "EXIT TUNNEL (USERS ON IRAN)"
+        info "Users stay on the Iran panel and their traffic leaves from Kharej"
+        info "Create the exit on the Iran server, then paste its key on Kharej with Create tunnel"
+        blank
+        item 1 "Xray exit: faster, UDP works, auto switch (recommended)"
+        item 2 "SOCKS exit: no Xray on Kharej, TCP only"
+        item 3 "Add an Xray exit to 3x-ui"
+        item 4 "Remove an Xray exit from 3x-ui"
+        item 5 "Panel setup guide"
+        item 6 "Install / Update Xray (Kharej)"
+        item 0 "Back"
+        menu_pick c 6
+        case $c in
+            1) xexit_create ;;
+            2) exit_create ;;
+            3) xexit_panel_menu add ;;
+            4) xexit_panel_menu remove ;;
+            5) xexit_panel_menu guide ;;
+            6) xray_menu ;;
+            0) return ;;
+        esac
+    done
+}
+
+xexit_delete() {
+    local n=$1 g=${T[GROUP]} side=${T[SIDE]} uuid=${T[UUID]} m all rest in_ui=n
+    local -a list=("$n")
+    all=$(xg_members "$g" | wc -l)
+    if ((all > 1)) && confirm "Delete the whole Xray exit '$g' ($(xg_label "$g"))?" y; then
+        mapfile -t list < <(xg_members "$g")
+    fi
+    confirm "Delete ${list[*]}?" n || return 0
+    [ "$side" = server ] && xui_has "$g" && in_ui=y
+    if [ "$in_ui" = y ]; then
+        rest=$(xg_ports_arg "$g" "${list[*]}")
+        if [ -z "$rest" ]; then
+            if confirm "Also remove this exit from 3x-ui? If not, users lose internet until you remove it by hand." y; then
+                xui_update "$g" "" ""
+            fi
+        else
+            xui_update "$g" "$rest" "$uuid"
+        fi
+    elif [ "$side" = server ] && ((${#list[@]} == all)); then
+        warn "If you added this exit to your panel by hand, remove its outbounds and rule there too"
+    fi
+    for m in "${list[@]}"; do
+        tunnel_remove "$m"
+        ok "Tunnel '$m' deleted"
+    done
+    [ -z "$(xg_members "$g")" ] && rm -f "$XEXIT_DIR/$g.key"
+    return 0
+}
+
+vless_probe() {
+    local port=$1 h=${2//-/} url=$3 host hp=80 i hdr='\x00'
+    host=${url#*://}
+    host=${host%%/*}
+    if [[ $host == *:* ]]; then
+        hp=${host##*:}
+        host=${host%:*}
+    fi
+    for ((i = 0; i < 32; i += 2)); do hdr+="\\x${h:i:2}"; done
+    hdr+=$(printf '\\x00\\x01\\x%02x\\x%02x\\x02\\x%02x%s' "$((hp >> 8))" "$((hp & 255))" "${#host}" "$host")
+    timeout 12 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1; printf "$2" >&3; printf "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8\r\nConnection: close\r\n\r\n" "$3" >&3; head -c 1500 <&3' _ "$port" "$hdr" "$host" 2>/dev/null | tr -d '\000\r' | tail -n 1
+}
+
+xexit_vless_test() {
+    local port=$1 uuid=$2 xb="" d sp pid i out
+    if xray_installed; then
+        xb=$XRAY_BIN
+    else
+        xui_env >/dev/null 2>&1
+        xb=$XUI_XBIN
+    fi
+    if [ -z "$xb" ] || [ ! -x "$xb" ]; then
+        out=$(vless_probe "$port" "$uuid" "${EXIT_TEST_URL/https:/http:}")
+        printf '%s' "$out"
+        [ -n "$out" ]
+        return
+    fi
+    d=$(mktemp -d)
+    sp=$(alloc_port 39000 "") || return 2
+    printf '{"log": {"loglevel": "none"}, "inbounds": [{"listen": "127.0.0.1", "port": %s, "protocol": "socks", "settings": {"udp": false}}], "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": %s, "users": [{"id": "%s", "encryption": "none"}]}]}, "streamSettings": {"network": "tcp", "security": "none"}}]}\n' "$sp" "$port" "$uuid" >"$d/c.json"
+    "$xb" run -c "$d/c.json" >/dev/null 2>&1 &
+    pid=$!
+    for ((i = 0; i < 20; i++)); do
+        [ -n "$(ss -H -lnt "sport = :$sp" 2>/dev/null)" ] && break
+        sleep 0.2
+    done
+    out=$(curl -s -m 12 --socks5-hostname "127.0.0.1:$sp" "$EXIT_TEST_URL" 2>/dev/null | head -c 60)
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -rf "$d"
+    printf '%s' "$out"
+    [ -n "$out" ]
+}
+
+xexit_diag_server() {
+    local cc=$1 p rc
+    if xui_has "${T[GROUP]}"; then
+        ok "Exit '${T[GROUP]}' is in the 3x-ui settings"
+    else
+        xui_env >/dev/null 2>&1
+        rc=$?
+        if ((rc == 0)); then
+            warn "Exit '${T[GROUP]}' is not in the 3x-ui settings, users still go out from Iran"
+            diag_fix "Use Exit tunnel > Add an Xray exit to 3x-ui"
+        else
+            info "3x-ui was not found here, check that your panel has the outbounds from the setup guide"
+        fi
+    fi
+    ((cc > 0)) || return 0
+    p=$(xexit_vless_test "${T[PORTS]}" "${T[UUID]}")
+    rc=$?
+    if ((rc == 2)); then
+        info "No Xray binary on this server to test the exit end to end"
+    elif ((rc == 0)) && is_ip "$p"; then
+        ok "The exit works through ${T[PROTO]}, traffic leaves from Kharej IP $p"
+    elif ((rc == 0)); then
+        ok "The exit works through ${T[PROTO]}"
+    else
+        err "The exit does not pass traffic through ${T[PROTO]}"
+        diag_fix "Run Diagnose on the Kharej server. Its Xray exit service must be running and it needs internet access"
+    fi
+}
+
+xexit_diag_client() {
+    local st
+    st=$(svc_state "$XRAY_SVC")
+    if [ "$st" = active ]; then
+        ok "Xray exit service is running"
+    else
+        err "Xray exit service is $st"
+        if xray_installed; then
+            diag_fix "Edit this tunnel and choose Save and apply, it writes and starts the Xray exit again"
+            journalctl -u "$XRAY_SVC" -n 6 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+        else
+            diag_fix "Xray is missing. Use Exit tunnel > Install / Update Xray"
+        fi
+        return
+    fi
+    if [ -n "$(ss -H -lnt "sport = :${T[XPORT]}" 2>/dev/null)" ]; then
+        ok "Xray listens on 127.0.0.1:${T[XPORT]}"
+    else
+        err "Xray does not listen on 127.0.0.1:${T[XPORT]}"
+        diag_fix "Edit this tunnel and choose Save and apply"
+    fi
 }
 
 LIP_KEYS=(NAME TYPE ROLE IFACE LOCAL REMOTE V4 PEER4 V6 PEER6 MTU VNI DPORT DEV CREATED)
@@ -3933,6 +5242,13 @@ backup_restore() {
     else
         warn "FRP is not installed. Install it to start the restored tunnels."
     fi
+    if [ -n "$(xray_groups_here)" ]; then
+        if xray_installed; then
+            xray_sync
+        else
+            warn "Xray is not installed. Use Exit tunnel > Install / Update Xray to start the restored exit."
+        fi
+    fi
     for n in frp-tunnel-fw.timer frp-tunnel-watchdog.timer frp-tunnel-acme.timer; do
         [ -f "$UNIT_DIR/$n" ] && systemctl enable --now "$n" >/dev/null 2>&1
     done
@@ -3981,6 +5297,11 @@ uninstall_all() {
     confirm "Continue?" n || return
     confirm "Create a backup first?" y && backup_create
     while read -r n; do
+        [ -n "$n" ] || continue
+        [ "$(meta_get "$(xg_members "$n" | head -n 1)" SIDE)" = server ] && xui_has "$n" || continue
+        confirm "Remove Xray exit '$n' from 3x-ui too?" y && xui_update "$n" "" ""
+    done < <(xg_names)
+    while read -r n; do
         [ -n "$n" ] && tunnel_remove "$n"
     done < <(tunnel_names)
     while read -r n; do
@@ -3990,7 +5311,7 @@ uninstall_all() {
         [ -x "$LIP_DIR/$n.sh" ] && "$LIP_DIR/$n.sh" down
         rm -f "$UNIT_DIR/frp-lip-$n.service"
     done < <(lip_names)
-    for u in frp-tunnel-fw.timer frp-tunnel-fw.service frp-tunnel-watchdog.timer frp-tunnel-watchdog.service frp-tunnel-acme.timer frp-tunnel-acme.service; do
+    for u in "$XRAY_SVC" frp-tunnel-fw.timer frp-tunnel-fw.service frp-tunnel-watchdog.timer frp-tunnel-watchdog.service frp-tunnel-acme.timer frp-tunnel-acme.service; do
         systemctl disable --now "$u" >/dev/null 2>&1
         rm -f "$UNIT_DIR/$u"
     done
@@ -4006,6 +5327,7 @@ uninstall_all() {
     res_sync
     rm -rf "${BASE_DIR:?}" "$LOG_DIR" "$WD_STATE"
     rm -f "$FRPS_BIN" "$FRPC_BIN" "$SELF_BIN"
+    rm -rf "${XRAY_LIB:?}"
     ok "FRP Tunnel has been removed"
     [ -d "$BACKUP_DIR" ] && info "Backups are kept in $BACKUP_DIR"
     printf '\e[0m\n'
@@ -4036,7 +5358,7 @@ main_menu() {
     case $c in
         1) frp_menu ;;
         2) tunnel_create ;;
-        3) exit_create ;;
+        3) exit_menu ;;
         4) tunnels_menu ;;
         5) tunnel_edit ;;
         6) tunnel_delete ;;
