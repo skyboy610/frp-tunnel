@@ -83,6 +83,7 @@ GSEC=()
 GPROTOS=()
 GKEY=n
 EXTRA_EXCL=""
+XEX_TPORTS=""
 XB_MAIN=()
 XB_FB=""
 PORT_LIST=()
@@ -2547,7 +2548,14 @@ def patch(cfg, g, uuid, ports, url, iv):
     outs = [o for o in (cfg.get("outbounds") or []) if not str(o.get("tag", "")).startswith(pre)]
     routing = cfg.get("routing") or {}
     bals = [b for b in (routing.get("balancers") or []) if b.get("tag") != g]
-    rules = [r for r in (routing.get("rules") or []) if r.get("balancerTag") != g and r.get("ruleTag") != g]
+    old = routing.get("rules") or []
+    mine = lambda r: r.get("balancerTag") == g or r.get("ruleTag") == g
+    rules = [r for r in old if not mine(r)]
+    pos = None
+    for i, r in enumerate(old):
+        if mine(r):
+            pos = len([x for x in old[:i] if not mine(x)])
+            break
     if not ports:
         rules = [r for r in rules if not str(r.get("outboundTag", "")).startswith(pre)]
     for k in ("observatory", "burstObservatory"):
@@ -2567,20 +2575,26 @@ def patch(cfg, g, uuid, ports, url, iv):
     main = [n for n in names if n != "kcp"] or names
     fb = "kcp" if "kcp" in names and main != names else (main[0] if main else "")
     if len(ports) > 1:
-        k = "burstObservatory" if isinstance(cfg.get("burstObservatory"), dict) else "observatory"
-        o = cfg.get(k)
-        if not isinstance(o, dict):
-            o = {"subjectSelector": [], "probeURL": url, "probeInterval": iv, "enableConcurrency": True}
-        o.setdefault("subjectSelector", []).extend(pre + n for n in main)
-        cfg[k] = o
+        ks = [k for k in ("observatory", "burstObservatory") if isinstance(cfg.get(k), dict)]
+        if not ks:
+            cfg["observatory"] = {"subjectSelector": [], "probeURL": url, "probeInterval": iv, "enableConcurrency": True}
+            ks = ["observatory"]
+        for k in ks:
+            cfg[k].setdefault("subjectSelector", []).extend(pre + n for n in main)
         bals.append({"tag": g, "selector": [pre + n for n in main], "strategy": {"type": "leastPing"}, "fallbackTag": pre + fb})
+    new = None
+    if len(ports) > 1:
+        new = {"type": "field", "ruleTag": g, "network": "tcp,udp", "balancerTag": g}
+    elif ports:
+        new = {"type": "field", "ruleTag": g, "network": "tcp,udp", "outboundTag": pre + ports[0][0]}
+    if new is not None:
+        if pos is None:
+            rules.append(new)
+        else:
+            rules.insert(pos, new)
     api = [i for i, r in enumerate(rules) if r.get("outboundTag") == "api" and "api" in (r.get("inboundTag") or [])]
     if api and api[0] != 0:
         rules.insert(0, rules.pop(api[0]))
-    if len(ports) > 1:
-        rules.append({"type": "field", "ruleTag": g, "network": "tcp,udp", "balancerTag": g})
-    elif ports:
-        rules.append({"type": "field", "ruleTag": g, "network": "tcp,udp", "outboundTag": pre + ports[0][0]})
     cfg["outbounds"] = outs
     routing["rules"] = rules
     if bals:
@@ -2618,6 +2632,12 @@ elif op == "patch":
         ports.append((n, int(v)))
     cfg = patch(cfg, sys.argv[4], sys.argv[6], ports, sys.argv[7], sys.argv[8])
     json.dump(cfg, open(sys.argv[3], "w"), indent=2)
+elif op == "info":
+    cfg = json.load(open(sys.argv[2]))
+    routing = cfg.get("routing") or {}
+    print("strategy=" + str(routing.get("domainStrategy") or ""))
+    keys = {"type", "ruleTag", "network", "balancerTag", "outboundTag"}
+    print("others=" + ",".join(r["ruleTag"] for r in (routing.get("rules") or []) if r.get("ruleTag") and r.get("ruleTag") != sys.argv[3] and set(r) <= keys and r.get("network")))
 elif op == "has":
     cfg = json.load(open(sys.argv[2]))
     pre = sys.argv[3] + "-"
@@ -2721,6 +2741,14 @@ xui_update() {
     sleep 2
     ok "3x-ui updated and Xray reloaded (backup: $bk)"
     return 0
+}
+
+xui_info() {
+    local g=$1 d
+    xui_env || return 1
+    d=$(mktemp -d)
+    xui_py get "$XUI_DB" "$d/t.json" "$(xui_default)" 2>/dev/null && xui_py info "$d/t.json" "$g" 2>/dev/null
+    rm -rf "$d"
 }
 
 xui_has() {
@@ -2882,6 +2910,10 @@ v_panel_base() {
     load_others
     for ((i = 0; i < ${#GPROTOS[@]}; i++)); do
         p=$(($1 + i))
+        if [[ $XEX_TPORTS == *" $p "* ]]; then
+            err "Port $p is a tunnel port of this exit"
+            return 1
+        fi
         if [ -n "${OTHERS[$p/tcp]}" ]; then
             err "Port $p belongs to tunnel ${OTHERS[$p/tcp]}"
             return 1
@@ -4185,6 +4217,48 @@ xexit_wait() {
     return 1
 }
 
+xexit_ready() {
+    local g=$1 n good=0 out rc
+    local -a ms=()
+    mapfile -t ms < <(xg_members "$g")
+    info "Testing the exit through each tunnel ..."
+    for n in "${ms[@]}"; do
+        out=$(xexit_vless_test "$(meta_get "$n" PORTS)" "$(meta_get "$n" UUID)")
+        rc=$?
+        if ((rc == 2)); then
+            warn "No Xray binary here to test the exit, skipping the test"
+            return 0
+        elif ((rc == 0)); then
+            ok "$(meta_get "$n" PROTO): traffic leaves from Kharej$(is_ip "$out" && printf ' IP %s' "$out")"
+            good=$((good + 1))
+        else
+            warn "$(meta_get "$n" PROTO): no traffic through this tunnel yet"
+        fi
+    done
+    ((good > 0)) && return 0
+    err "The exit does not pass traffic yet. Check the Kharej server with Logs & diagnose."
+    confirm "Add it to 3x-ui anyway? Users lose internet until the exit works." n
+}
+
+xexit_precheck() {
+    local g=$1 line s="" o=""
+    xexit_ready "$g" || return 1
+    while IFS= read -r line; do
+        case $line in
+            strategy=*) s=${line#strategy=} ;;
+            others=*) o=${line#others=} ;;
+        esac
+    done < <(xui_info "$g")
+    if [ -n "$o" ]; then
+        warn "3x-ui already sends users to exit '$o'. Its rule comes first, so '$g' is used only when that one is removed."
+    fi
+    if [ "$s" = IPIfNonMatch ]; then
+        warn "Your panel routing uses IPIfNonMatch. After this, rules with geoip only match IP addresses, not domains."
+        info "Add domain rules such as geosite:category-ir to direct above the exit rule if you need them"
+    fi
+    return 0
+}
+
 xexit_panel() {
     local g=$1 rc
     xui_env
@@ -4196,7 +4270,7 @@ xexit_panel() {
     elif ((rc == 0)); then
         info "3x-ui was found on this server"
         info "Close the Xray Configs page in your browser first, or saving it later will undo this change"
-        if confirm "Add the Kharej exit to 3x-ui now?" y; then
+        if confirm "Add the Kharej exit to 3x-ui now?" y && xexit_precheck "$g"; then
             xui_update "$g" "$(xg_ports_arg "$g")" "$(meta_get "$(xg_members "$g" | head -n 1)" UUID)" && return 0
         fi
     fi
@@ -4274,7 +4348,9 @@ xexit_create() {
     for ((i = 0; i < ${#GPROTOS[@]}; i++)); do ex+="$((base + i)) "; done
     if [ "$adv" = y ]; then
         section "Panel ports"
+        XEX_TPORTS=" ${tports[*]} "
         ask base "First panel port on 127.0.0.1" "$base" v_panel_base "-"
+        XEX_TPORTS=""
         for ((i = 0; i < ${#GPROTOS[@]}; i++)); do ex+="$((base + i)) "; done
     fi
     uuid=$(gen_uuid)
@@ -4313,7 +4389,6 @@ xexit_create() {
         T[PORTS]=$((base + i))
         T[UUID]=$uuid
         T[XPORT]=""
-        [ "${T[CERT_MODE]}" = self ] || T[CERT_REF]=""
         section "Tunnel $n"
         if ! tunnel_apply; then
             err "Tunnel $n was saved but its service did not start. Use Edit to fix it."
@@ -4340,17 +4415,23 @@ xexit_import() {
     g=${GH[GROUP]}
     section "Xray exit '$g' from the Iran server"
     kv "Tunnels" "${#GSEC[@]}"
-    if ! need_xray; then
-        err "Xray is needed on this server for an Xray exit"
-        pause
-        return
-    fi
     if xg_taken "$g"; then
-        if [ "$(meta_get "$(xg_members "$g" | head -n 1)" UUID)" = "${GH[UUID]}" ] && confirm "Exit '$g' already exists here. Replace it with this key?" y; then
+        m=$(xg_members "$g" | head -n 1)
+        if [ -n "$m" ] && [ "$(meta_get "$m" UUID)" = "${GH[UUID]}" ] && [ "$(meta_get "$m" SIDE)" = server ]; then
+            err "This key belongs to an exit that was created on this server. Paste it on the Kharej server."
+            pause
+            return
+        fi
+        if [ -n "$m" ] && [ "$(meta_get "$m" UUID)" = "${GH[UUID]}" ] && confirm "Exit '$g' already exists here. Replace it with this key?" y; then
             for m in $(xg_members "$g"); do tunnel_remove "$m"; done
         else
             ask g "Name for this exit on this server" "$(next_group)" v_new_group "-"
         fi
+    fi
+    if ! need_xray; then
+        err "Xray is needed on this server for an Xray exit"
+        pause
+        return
     fi
     xp=$(alloc_port 30800 "") || {
         err "No free local port for Xray"
@@ -4439,8 +4520,9 @@ xexit_panel_menu() {
     fi
     if [ "$op" = add ]; then
         info "Close the Xray Configs page in your browser first, or saving it later will undo this change"
-        confirm "Add exit '$g' to 3x-ui now?" y && xui_update "$g" "$(xg_ports_arg "$g")" "$(meta_get "$(xg_members "$g" | head -n 1)" UUID)"
+        confirm "Add exit '$g' to 3x-ui now?" y && xexit_precheck "$g" && xui_update "$g" "$(xg_ports_arg "$g")" "$(meta_get "$(xg_members "$g" | head -n 1)" UUID)"
     else
+        info "Close the Xray Configs page in your browser first, or saving it later will bring this exit back"
         confirm "Remove exit '$g' from 3x-ui? Users will go out directly from Iran again." y && xui_update "$g" "" ""
     fi
     pause
@@ -4483,13 +4565,16 @@ xexit_delete() {
     confirm "Delete ${list[*]}?" n || return 0
     [ "$side" = server ] && xui_has "$g" && in_ui=y
     if [ "$in_ui" = y ]; then
+        info "Close the Xray Configs page in your browser first, or saving it later will bring this exit back"
         rest=$(xg_ports_arg "$g" "${list[*]}")
         if [ -z "$rest" ]; then
             if confirm "Also remove this exit from 3x-ui? If not, users lose internet until you remove it by hand." y; then
-                xui_update "$g" "" ""
+                if ! xui_update "$g" "" ""; then
+                    confirm "3x-ui was not changed. Delete the tunnels anyway? Users lose internet until you fix the panel by hand." n || return 0
+                fi
             fi
-        else
-            xui_update "$g" "$rest" "$uuid"
+        elif ! xui_update "$g" "$rest" "$uuid"; then
+            confirm "3x-ui was not changed. Delete anyway? The panel may still use the deleted tunnel." n || return 0
         fi
     elif [ "$side" = server ] && ((${#list[@]} == all)); then
         warn "If you added this exit to your panel by hand, remove its outbounds and rule there too"
@@ -5325,15 +5410,21 @@ backup_menu() {
 
 uninstall_all() {
     local n u
+    local -a gs=()
     header "UNINSTALL"
     warn "This removes all tunnels, local IPs, certificates, services and FRP binaries."
     confirm "Continue?" n || return
     confirm "Create a backup first?" y && backup_create
-    while read -r n; do
-        [ -n "$n" ] || continue
+    mapfile -t gs < <(xg_names)
+    for n in "${gs[@]}"; do
         [ "$(meta_get "$(xg_members "$n" | head -n 1)" SIDE)" = server ] && xui_has "$n" || continue
-        confirm "Remove Xray exit '$n' from 3x-ui too?" y && xui_update "$n" "" ""
-    done < <(xg_names)
+        info "Close the Xray Configs page in your browser first, or saving it later will bring exit '$n' back"
+        if confirm "Remove Xray exit '$n' from 3x-ui too? If not, users lose internet until you remove it by hand." y; then
+            if ! xui_update "$n" "" ""; then
+                confirm "3x-ui was not changed. Uninstall anyway?" n || return
+            fi
+        fi
+    done
     while read -r n; do
         [ -n "$n" ] && tunnel_remove "$n"
     done < <(tunnel_names)
